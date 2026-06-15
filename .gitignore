@@ -1,0 +1,12 @@
+# Sensitive
+.env
+*.secret
+*token*
+
+# Backups
+backups/
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db

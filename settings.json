@@ -1,0 +1,173 @@
+{
+  "env": {
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
+    "DISABLE_COMPACT": "1",
+    "RESOURCE_HARD_FLOOR_MB": "2048",
+    "RESOURCE_MAX_AGENTS_HARD": "12",
+    "RESOURCE_MAX_AGENT_CAP": "15",
+    "RESOURCE_MIN_AVAILABLE_GB": "6",
+    "RESOURCE_PER_AGENT_MB": "1000",
+    "RESOURCE_RATE_THRESHOLD_MB": "300",
+    "RESOURCE_SOFT_FLOOR_MB": "5120",
+    "SHELL": "/bin/zsh"
+  },
+  "permissions": {
+    "deny": [
+      "Bash:rm *",
+      "Bash:rmdir *",
+      "Bash:git push --force *",
+      "Bash:git branch -D *",
+      "Bash:git reset --hard *",
+      "Bash:chmod *",
+      "Bash:chown *",
+      "Bash:dd *",
+      "Bash:mkfs *",
+      "Bash:parted *",
+      "Bash:fdisk *",
+      "Bash:> *"
+    ],
+    "defaultMode": "bypassPermissions"
+  },
+  "model": "opus",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/ram-monitor.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bd prime"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/shentao.lu/.claude/env-wrapper.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk hook claude"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/resource-guard.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/shentao.lu/.claude/session-init.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/superboost-banner.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bd prime"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [],
+    "PostToolUseFailure": [],
+    "Stop": []
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/hooks/superboost-statusline.sh",
+    "padding": 0,
+    "refreshInterval": 10
+  },
+  "enabledPlugins": {
+    "andrej-karpathy-skills@karpathy-skills": true,
+    "bash-language-server@claude-code-lsps": true,
+    "plugin-dev@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "voltagent-core-dev@voltagent-subagents": true,
+    "voltagent-dev-exp@voltagent-subagents": false,
+    "voltagent-infra@voltagent-subagents": true,
+    "voltagent-lang@voltagent-subagents": true,
+    "voltagent-meta@voltagent-subagents": true,
+    "voltagent-qa-sec@voltagent-subagents": true,
+    "vtsls@claude-code-lsps": true,
+    "yaml-language-server@claude-code-lsps": true,
+    "oh-my-claudecode@omc-local": true,
+    "claude-mem@thedotmack": true
+  },
+  "extraKnownMarketplaces": {
+    "claude-code-lsps": {
+      "source": {
+        "source": "github",
+        "repo": "boostvolt/claude-code-lsps"
+      }
+    },
+    "karpathy-skills": {
+      "source": {
+        "source": "github",
+        "repo": "multica-ai/andrej-karpathy-skills"
+      }
+    },
+    "thedotmack": {
+      "source": {
+        "source": "github",
+        "repo": "thedotmack/claude-mem"
+      }
+    },
+    "voltagent-subagents": {
+      "source": {
+        "source": "github",
+        "repo": "VoltAgent/awesome-claude-code-subagents"
+      }
+    },
+    "omc-local": {
+      "source": {
+        "source": "github",
+        "repo": "Yeachan-Heo/oh-my-claudecode"
+      }
+    }
+  },
+  "effortLevel": "xhigh",
+  "autoUpdatesChannel": "latest",
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark"
+}
