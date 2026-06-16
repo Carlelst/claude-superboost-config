@@ -1,12 +1,20 @@
-# Sensitive
+# Sensitive data
 .env
 *.secret
 *token*
+*.key
 
 # Backups
 backups/
 *.bak
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
+
+# OMC managed files (auto-generated)
+.omc-managed
+
+# Compiled Python files
+__pycache__/
+*.pyc

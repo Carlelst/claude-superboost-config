@@ -1,0 +1,32 @@
+{
+  "claude-code-lsps": {
+    "source": {
+      "source": "github",
+      "repo": "boostvolt/claude-code-lsps"
+    }
+  },
+  "karpathy-skills": {
+    "source": {
+      "source": "github",
+      "repo": "multica-ai/andrej-karpathy-skills"
+    }
+  },
+  "thedotmack": {
+    "source": {
+      "source": "github",
+      "repo": "thedotmack/claude-mem"
+    }
+  },
+  "voltagent-subagents": {
+    "source": {
+      "source": "github",
+      "repo": "VoltAgent/awesome-claude-code-subagents"
+    }
+  },
+  "omc-local": {
+    "source": {
+      "source": "github",
+      "repo": "Yeachan-Heo/oh-my-claudecode"
+    }
+  }
+}
