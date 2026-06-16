@@ -48,3 +48,14 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system architectur
 - **PreToolUse**: env-wrapper → rtk hook (Bash compression)
 - **PostToolUse**: ram-monitor
 - **PreCompact**: bd prime (context refresh)
+
+## 持续同步
+
+本机配置变更后，同步到仓库：
+
+```bash
+cd ~/.hub/claude-config
+./sync.sh
+```
+
+脚本会自动复制最新配置文件、hooks、skills、agents，展示 diff，确认后 commit + push。
