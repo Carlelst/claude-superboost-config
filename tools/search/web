@@ -1,0 +1,773 @@
+#!/bin/bash
+# ============================================================
+# web — Unified search/fetch dispatcher for Claude Code
+# ============================================================
+# Routes queries to the right backend with automatic fallback.
+# Backed by SearXNG with 249 engines across 31 categories.
+#
+# Usage:
+#   web search <query>            Keyword search (multi-engine)
+#   web fetch <url>               Fetch URL content (auto-detect)
+#   web extract <url>             Full content extraction (text + auto image desc)
+#   web full <url>                Alias for extract
+#   web vision <url>              Force image descriptions
+#   web extract-images <url>      Alias for vision
+#   web news <query>              News search
+#   web deep <query>              Search + read top 5 results
+#   web synthesize <query>        Multi-source research synthesis (MapReduce)
+#   web it <query>                IT/dev search (GitHub/SO/npm/...)
+#   web science <query>           Academic search (arXiv/PubMed/...)
+#   web packages <query>          Package search (npm/PyPI/crates/...)
+#   web repos <query>             Code repos (GitHub/GitLab/HF/...)
+#   web qa <query>                Q&A (StackOverflow/AskUbuntu/...)
+#   web videos <query>            Video search
+#   web probe                     Full health check (engines + categories)
+#
+# Exit codes:
+#   0 — success (≥ MIN_RESULTS)
+#   1 — SearXNG unavailable or low-quality → use WebSearch/WebFetch
+#   2 — gh CLI unavailable → use searx or WebFetch
+#   3 — invalid usage
+# ============================================================
+
+set -euo pipefail
+
+# Global temp file registry for cleanup
+_WEB_TMPFILES=()
+_web_cleanup() {
+    for f in "${_WEB_TMPFILES[@]}"; do
+        [ -n "$f" ] && rm -f "$f" 2>/dev/null || true
+    done
+}
+trap _web_cleanup EXIT
+
+SEARX_BIN="${SEARX_BIN:-searx}"
+SEARX_HOST="${SEARXNG_URL:-http://192.168.20.21:8005}"
+SEARX_TIMEOUT="${SEARX_TIMEOUT:-15}"
+MIN_RESULTS="${WEB_MIN_RESULTS:-3}"
+RERANK_URL="${RERANK_URL:-http://172.16.90.45:8082}"
+RERANK_MODEL="${RERANK_MODEL:-scs_bge-reranker}"
+RERANK_ENABLED="${RERANK_ENABLED:-true}"
+
+# ── Help ───────────────────────────────────────────────────
+usage() {
+    cat <<'EOF'
+web — Unified search/fetch dispatcher (249 engines, 31 categories)
+
+Usage:
+  web search   <query>         Keyword search (multi-engine, most stable)
+  web fetch    <url>           Fetch page content
+  web news     <query>         News search
+  web deep     <query>         Search + read top 5 full text
+  web it       <query>         IT/dev (GitHub, SO, npm, PyPI, crates, HF, MDN...)
+  web science  <query>         Academic (arXiv, PubMed, Google Scholar...)
+  web packages <query>         Packages (npm, PyPI, crates.io, Docker Hub...)
+  web repos    <query>         Code repos (GitHub, GitLab, HuggingFace...)
+  web qa       <query>         Q&A (StackOverflow, AskUbuntu...)
+  web videos   <query>         Videos (YouTube, Bilibili...)
+  web images   <query>         Images
+  web gh       <args>          GitHub CLI shortcut
+  web probe                    Full health check
+
+Flags:
+  --engine E     Specify single engine (usually unnecessary)
+  --time T       Time filter (day|week|month|year)
+  --count N      Results count (default 5)
+  --lang L       Language (zh-CN|en|all)
+  --no-rerank    Skip BGE-Reranker (default: enabled)
+
+Exit codes:
+  0 — success (≥3 results)
+  1 — SearXNG unavailable or <3 results → use WebSearch/WebFetch
+  2 — gh CLI unavailable
+EOF
+    exit 3
+}
+
+# ── Health checks ──────────────────────────────────────────
+check_searx() {
+    curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+        "$SEARX_HOST/config" 2>/dev/null | grep -q '^2' && return 0
+    return 1
+}
+
+check_gh() {
+    command -v gh &>/dev/null && gh auth status &>/dev/null && return 0
+    return 1
+}
+
+# ── Comprehensive probe ───────────────────────────────────
+probe_full() {
+    python3 << 'PYEOF'
+import json, urllib.parse, urllib.request, time
+
+SEARXNG_URL = "http://192.168.20.21:8005"
+
+def search(query, params_extra, timeout=8):
+    data = urllib.parse.urlencode({
+        "q": query, "format": "json", "number_of_results": 3,
+        "language": "all", **params_extra
+    }).encode()
+    req = urllib.request.Request(SEARXNG_URL + "/search",
+        data=data, headers={"X-Forwarded-For": "127.0.0.1"})
+    start = time.time()
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        elapsed = time.time() - start
+        d = json.loads(resp.read())
+        return len(d.get("results", [])), elapsed, d.get("unresponsive_engines", [])
+    except Exception as e:
+        return 0, time.time() - start, []
+
+# 1. Instance info
+try:
+    req = urllib.request.Request(SEARXNG_URL + "/config",
+        headers={"X-Forwarded-For": "127.0.0.1"})
+    cfg = json.loads(urllib.request.urlopen(req, timeout=5).read())
+    n_engines = len(cfg.get("engines", []))
+    n_cats = len(cfg.get("categories", []))
+    print(f"🏗️  SearXNG {cfg.get('version','?')} — {n_engines} engines, {n_cats} categories")
+except:
+    print("⚠️  Cannot reach SearXNG config endpoint")
+    n_engines, n_cats = 0, 0
+
+# 2. Category probe
+print(f"\n📂 类别健康度")
+print("-" * 58)
+cats = [
+    ("general",          "kubernetes",          "通用搜索"),
+    ("news",             "AI regulation",       "新闻"),
+    ("it",               "async runtime",       "IT 开发"),
+    ("science",          "transformer model",   "科学论文"),
+    ("packages",         "tokio",               "包管理器"),
+    ("repos",            "async runtime",       "代码仓库"),
+    ("q&a",              "rust async",          "问答"),
+    ("videos",           "rust programming",    "视频"),
+    ("images",           "kubernetes",          "图片"),
+    ("software wikis",   "systemd service",     "软件Wiki"),
+    ("books",            "deep learning",       "书籍"),
+]
+for cat, query, label in cats:
+    n, elapsed, unresp = search(query, {"categories": cat})
+    status = "✅" if n > 0 else "❌"
+    susp = len(unresp)
+    susp_str = f" [{susp} suspended]" if susp else ""
+    print(f"  {status} {cat:18s} ({label:6s}) → {n:>3} results ({elapsed:.1f}s){susp_str}")
+
+# 3. Key individual engines
+print(f"\n🔧 关键引擎")
+print("-" * 58)
+engines = [
+    ("google",  "kubernetes"), ("bing", "kubernetes"),
+    ("baidu",   "kubernetes"), ("sogou", "kubernetes"),
+    ("npm",     "express"),    ("mdn", "fetch api"),
+    ("github",  "tokio"),      ("stackoverflow", "rust"),
+]
+for eng, query in engines:
+    n, elapsed, unresp = search(query, {"engines": eng})
+    status = "✅" if n > 0 else "❌"
+    err = ""
+    if unresp:
+        err = f" [{unresp[0][1][:30]}]"
+    print(f"  {status} {eng:20s} → {n:>2} results ({elapsed:.1f}s){err}")
+
+print(f"\n💡 策略建议: 不指定 --engine，用类别 (--it/--news/...) 或多引擎聚合")
+PYEOF
+}
+
+# ── GitHub routing ─────────────────────────────────────────
+route_github() {
+    local url="$1"
+    local slug
+
+    slug=$(echo "$url" | sed -E 's|https?://github\.com/||; s|/$||')
+
+    if [[ "$slug" =~ /issues/([0-9]+) ]]; then
+        slug="${slug%/issues/*}"
+        gh issue view "${BASH_REMATCH[1]}" --repo "$slug" 2>/dev/null && return 0
+        gh issue view "${BASH_REMATCH[1]}" --repo "$slug" --comments 2>/dev/null && return 0
+        return 2
+    fi
+
+    if [[ "$slug" =~ /pull/([0-9]+) ]]; then
+        slug="${slug%/pull/*}"
+        gh pr view "${BASH_REMATCH[1]}" --repo "$slug" 2>/dev/null && return 0
+        gh pr view "${BASH_REMATCH[1]}" --repo "$slug" --comments 2>/dev/null && return 0
+        return 2
+    fi
+
+    gh api "repos/$slug" --jq '.description' 2>/dev/null && return 0
+    return 2
+}
+
+# ── Parse result count ────────────────────────────────────
+parse_result_count() {
+    echo "$1" | grep -oP '结果数:\s*\K[0-9]+' 2>/dev/null || echo "0"
+}
+
+# ── BGE-Reranker integration ───────────────────────────────
+# Rerank search results using BGE-Reranker-v2-m3
+# Input: JSON from searx --raw on stdin
+# Output: Reordered JSON with rerank_score added
+rerank_results() {
+    local query="$1"
+    export _WEB_QUERY="$query"
+    export _WEB_RERANK_URL="$RERANK_URL"
+    export _WEB_RERANK_MODEL="$RERANK_MODEL"
+    python3 -c "
+import sys, json, math, urllib.request, time, os
+
+query = os.environ['_WEB_QUERY']
+rerank_url = os.environ['_WEB_RERANK_URL']
+model = os.environ['_WEB_RERANK_MODEL']
+
+try:
+    data = json.load(sys.stdin)
+except:
+    sys.exit(0)
+
+results = data.get('results', [])
+if not results:
+    json.dump(data, sys.stdout, ensure_ascii=False)
+    sys.exit(0)
+
+# Build items for reranking
+items = []
+for r in results:
+    text = f\"{r.get('title','')} {r.get('content','')}\"
+    items.append(text[:500])
+
+# Call BGE-Reranker API
+payload = json.dumps({
+    'model': model,
+    'queries': [query],
+    'items': items
+}).encode()
+
+try:
+    start = time.time()
+    req = urllib.request.Request(
+        f'{rerank_url}/v1/score',
+        data=payload,
+        headers={'Content-Type': 'application/json'})
+    resp = urllib.request.urlopen(req, timeout=10)
+    elapsed = time.time() - start
+    score_data = json.loads(resp.read())
+except Exception as e:
+    # Reranker failed — return original results unchanged
+    data['_rerank'] = {'status': 'failed', 'error': str(e)}
+    json.dump(data, sys.stdout, ensure_ascii=False)
+    sys.exit(0)
+
+# Parse scores and apply sigmoid normalization
+raw_scores = [0.0] * len(items)
+for s in score_data.get('data', []):
+    raw_scores[s['index']] = s['score']
+
+def sigmoid(x):
+    return 1 / (1 + math.exp(-max(-500, min(500, x))))
+
+norm_scores = [sigmoid(s) for s in raw_scores]
+
+# Sort by score descending
+indexed = list(enumerate(results))
+indexed.sort(key=lambda x: norm_scores[x[0]], reverse=True)
+
+# Rebuild results with scores
+reranked = []
+for orig_idx, r in indexed:
+    r['rerank_score'] = round(norm_scores[orig_idx], 4)
+    r['rerank_raw'] = round(raw_scores[orig_idx], 4)
+    reranked.append(r)
+
+data['results'] = reranked
+data['_rerank'] = {
+    'status': 'ok',
+    'model': model,
+    'latency_s': round(elapsed, 3),
+    'count': len(reranked)
+}
+json.dump(data, sys.stdout, ensure_ascii=False)
+" 2>/dev/null
+    unset _WEB_QUERY _WEB_RERANK_URL _WEB_RERANK_MODEL
+}
+
+# ── Format reranked JSON as text ─────────────────────────
+format_reranked_output() {
+    local query="$1"
+    local display_count="$2"
+    export _WEB_QUERY="$query"
+    export _WEB_DISPLAY_COUNT="$display_count"
+    python3 -c "
+import sys, json, os
+
+data = json.load(sys.stdin)
+results = data.get('results', [])
+rerank_info = data.get('_rerank', {})
+query = os.environ['_WEB_QUERY']
+display_count = int(os.environ['_WEB_DISPLAY_COUNT'])
+
+# Header
+status = rerank_info.get('status', 'none')
+if status == 'ok':
+    latency = rerank_info.get('latency_s', 0)
+    total = len(results)
+    shown = min(display_count, total)
+    print(f'═══ 搜索结果: {query} [reranked {latency}s] ═══')
+    print(f'结果数: {total} (显示前 {shown})')
+    print()
+else:
+    total = len(results)
+    print(f'═══ 搜索结果: {query} ═══')
+    print(f'结果数: {total}')
+    print()
+
+# Results
+for i, r in enumerate(results[:display_count], 1):
+    title = r.get('title', '(无标题)')
+    url = r.get('url', '')
+    content = r.get('content', '')[:200]
+    engine = r.get('engine', '')
+    score = r.get('rerank_score', '')
+
+    score_str = f' [{score}]' if score else ''
+    print(f'[{i}] {title}{score_str}')
+    print(f'    URL: {url}')
+    if engine:
+        print(f'    来源: {engine}')
+    if content:
+        print(f'    {content}')
+    print()
+
+if not results:
+    print('(无搜索结果)')
+" 2>/dev/null
+    unset _WEB_QUERY _WEB_DISPLAY_COUNT
+}
+
+# ── SearXNG search with reranking + quality gate + 3 retries ─
+do_search_reranked() {
+    local query="$1"; shift
+    local extra_args=("$@")
+    local display_count=5
+
+    # Extract --count if specified
+    for ((i=0; i<${#extra_args[@]}; i++)); do
+        if [ "${extra_args[$i]}" = "--count" ]; then
+            display_count="${extra_args[$((i+1))]}"
+            break
+        fi
+    done
+
+    # Fetch 2x results for reranking
+    local fetch_count=$((display_count * 2))
+    [ "$fetch_count" -lt 10 ] && fetch_count=10
+
+    # Temp files for JSON passing
+    local tmp_raw=$(mktemp /tmp/web_raw.XXXXXX)
+    local tmp_reranked=$(mktemp /tmp/web_reranked.XXXXXX)
+    _WEB_TMPFILES+=("$tmp_raw" "$tmp_reranked")
+
+    # Build raw args: strip --count, add --count N --raw
+    local raw_args=()
+    local skip_next=false
+    for ((i=0; i<${#extra_args[@]}; i++)); do
+        if [ "$skip_next" = "true" ]; then skip_next=false; continue; fi
+        if [ "${extra_args[$i]}" = "--count" ]; then skip_next=true; continue; fi
+        raw_args+=("${extra_args[$i]}")
+    done
+    raw_args+=("--count" "$fetch_count" "--raw")
+
+    # Search + rerank + quality check, write result to tmp_reranked
+    # Returns 0 if quality pass, 1 if fail
+    do_one_search() {
+        local -a sargs=("$@")
+        if timeout "$SEARX_TIMEOUT" "$SEARX_BIN" "$query" "${sargs[@]}" > "$tmp_raw" 2>/dev/null; then
+            local count
+            export _WEB_TMP="$tmp_raw"
+            count=$(python3 -c "
+import json, os
+data = json.load(open(os.environ['_WEB_TMP']))
+print(len(data.get('results',[])))
+" 2>/dev/null || echo "0")
+            if [ "$count" -ge "$MIN_RESULTS" ]; then
+                cat "$tmp_raw" | rerank_results "$query" > "$tmp_reranked" 2>/dev/null
+                # Quality gate
+                local pass
+                export _WEB_TMPR="$tmp_reranked"
+                pass=$(python3 -c "
+import json, os
+data = json.load(open(os.environ['_WEB_TMPR']))
+results = data.get('results', [])
+rerank = data.get('_rerank', {})
+if rerank.get('status') != 'ok':
+    print('pass'); exit()
+top5 = results[:5]
+if not top5:
+    print('fail'); exit()
+scores = [r.get('rerank_score', 0) for r in top5]
+avg = sum(scores) / len(scores)
+mx = max(scores)
+domains = set()
+for r in top5:
+    url = r.get('url', '')
+    if '/' in url: domains.add(url.split('/')[2])
+if avg >= 0.5:
+    print('pass')
+elif avg >= 0.3 and mx >= 0.5 and len(domains) >= 2:
+    print('pass')
+else:
+    print('fail')
+" 2>/dev/null || echo "pass")
+                if [ "$pass" = "pass" ]; then
+                    return 0
+                fi
+            fi
+        fi
+        return 1
+    }
+
+    # Attempt 0: original search
+    if do_one_search "${raw_args[@]}"; then
+        cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
+        return 0
+    fi
+
+    # Attempt 1: switch/add category
+    echo "🔄 重试 1/3: 切换类别..." >&2
+    local has_category=false
+    local retry1_args=()
+    skip_next=false
+    for ((i=0; i<${#extra_args[@]}; i++)); do
+        if [ "$skip_next" = "true" ]; then skip_next=false; continue; fi
+        case "${extra_args[$i]}" in
+            --it|--science|--packages|--repos|--qa|--videos|--images|--wiki|--books|--social|--weather|--map|--news)
+                has_category=true
+                continue ;;  # Remove existing category
+            --engine|--time|--count|--lang) skip_next=true; retry1_args+=("${extra_args[$i]}" "${extra_args[$((i+1))]}"); continue ;;
+        esac
+        retry1_args+=("${extra_args[$i]}")
+    done
+    # If no category was specified, add --it (most common for dev queries)
+    if [ "$has_category" = "false" ]; then
+        retry1_args+=("--it")
+    fi
+    local retry1_raw=()
+    skip_next=false
+    for ((i=0; i<${#retry1_args[@]}; i++)); do
+        if [ "$skip_next" = "true" ]; then skip_next=false; continue; fi
+        if [ "${retry1_args[$i]}" = "--count" ]; then skip_next=true; continue; fi
+        retry1_raw+=("${retry1_args[$i]}")
+    done
+    retry1_raw+=("--count" "$fetch_count" "--raw")
+    if do_one_search "${retry1_raw[@]}"; then
+        cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
+        return 0
+    fi
+
+    # Attempt 2: try specific engines (bing, baidu)
+    echo "🔄 重试 2/3: 切换引擎..." >&2
+    for eng in bing baidu; do
+        local retry2_raw=("${retry1_raw[@]}" "--engine" "$eng")
+        if do_one_search "${retry2_raw[@]}"; then
+            cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
+            return 0
+        fi
+    done
+
+    # Attempt 3: simplify query
+    echo "🔄 重试 3/3: 简化查询..." >&2
+    simple_query=$(echo "$query" | _WEB_QRY="$query" python3 -c "
+import sys, re, os
+q = os.environ['_WEB_QRY']
+q = re.sub(r'(怎么|如何|为什么|什么是|what is|how to|why|best|top|vs|versus|比较|对比|推荐)', '', q, flags=re.I)
+q = re.sub(r'\b(20\d{2})\b', '', q)
+q = re.sub(r'\s+', ' ', q).strip()
+print(q if len(q) > 2 else '')
+" 2>/dev/null)
+    if [ -n "$simple_query" ] && [ "$simple_query" != "$query" ]; then
+        if do_one_search "${retry1_raw[@]}"; then
+            cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
+            return 0
+        fi
+    fi
+
+    # All retries failed — output best available + warning
+    if [ -s "$tmp_reranked" ]; then
+        echo "⚠️  搜索质量偏低（3 次重试均未改善），以下为最佳可用结果" >&2
+        cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
+        return 1
+    fi
+
+    echo "" >&2
+    echo "⚠️  SearXNG unavailable (host: $SEARX_HOST)" >&2
+    echo "👉 FALLBACK: Use built-in WebSearch tool instead" >&2
+    return 1
+}
+
+# ── SearXNG search (no rerank) with retry logic ────────────
+do_search() {
+    local query="$1"; shift
+    local extra_args=("$@")
+
+    # Try search, return 0 if enough results
+    try_text_search() {
+        local -a sargs=("$@")
+        local output
+        if output=$(timeout "$SEARX_TIMEOUT" "$SEARX_BIN" "$query" "${sargs[@]}" 2>/dev/null); then
+            local count
+            count=$(parse_result_count "$output")
+            if [ "$count" -ge "$MIN_RESULTS" ]; then
+                echo "$output"
+                return 0
+            fi
+        fi
+        return 1
+    }
+
+    # Attempt 0: original
+    if try_text_search "${extra_args[@]}"; then
+        return 0
+    fi
+
+    # Attempt 1: add --it if no category
+    local has_cat=false
+    for a in "${extra_args[@]}"; do
+        case "$a" in --it|--science|--packages|--repos|--qa|--videos|--images|--wiki|--books|--social|--weather|--map|--news) has_cat=true ;; esac
+    done
+    if [ "$has_cat" = "false" ]; then
+        echo "🔄 重试: 加 --it 类别..." >&2
+        if try_text_search "${extra_args[@]}" "--it"; then
+            return 0
+        fi
+    fi
+
+    # Attempt 2: try engines
+    echo "🔄 重试: 切换引擎..." >&2
+    for eng in bing baidu; do
+        if try_text_search "${extra_args[@]}" "--engine" "$eng"; then
+            return 0
+        fi
+    done
+
+    echo "⚠️  SearXNG 搜索结果不足" >&2
+    echo "👉 FALLBACK: Use built-in WebSearch tool instead" >&2
+    return 1
+}
+
+# ── URL fetch ──────────────────────────────────────────────
+do_fetch() {
+    local url="$1"
+    if [[ "$url" =~ ^https?://github\.com ]]; then
+        if check_gh; then
+            route_github "$url" && return 0
+        fi
+        echo "⚠️  gh CLI unavailable — falling back to web-extract" >&2
+    fi
+    # Use web-extract with full extraction chain (text-only for fast fetch)
+    if command -v web-extract &>/dev/null; then
+        web-extract "$url" --no-vision 2>/dev/null && return 0
+        echo "⚠️  web-extract failed — falling back to SearXNG fetch" >&2
+    fi
+    if check_searx; then
+        local fetch_output
+        if fetch_output=$("$SEARX_BIN" "$url" 2>/dev/null) && [ -n "$fetch_output" ]; then
+            echo "$fetch_output"
+            return 0
+        fi
+    fi
+    echo "⚠️  All fetch methods failed" >&2
+    echo "👉 FALLBACK: Use built-in WebFetch tool instead" >&2
+    return 1
+}
+
+# ── Full extraction ────────────────────────────────────────
+do_extract() {
+    local url="$1"
+    shift || true
+    if command -v web-extract &>/dev/null; then
+        web-extract "$url" "$@" && return 0
+    fi
+    # Fallback to do_fetch
+    do_fetch "$url"
+}
+
+# ── Main dispatch ──────────────────────────────────────────
+[[ $# -eq 0 ]] && usage
+
+CMD="${1:-}"; shift || true
+
+QUERY=""
+EXTRA=()
+NO_RERANK=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --engine|--time|--count|--lang) EXTRA+=("$1" "$2"); shift 2 ;;
+        --engine=*|--time=*|--count=*|--lang=*) EXTRA+=("$1"); shift ;;
+        --no-rerank) NO_RERANK=true; shift ;;
+        # Pass through web-extract flags (don't eat as QUERY)
+        --no-vision|--vision|--no-text|--raw|--raw-html|--summarize|--no-summarize) EXTRA+=("$1"); shift ;;
+        --mode|--crawler) EXTRA+=("$1" "$2"); shift 2 ;;
+        --mode=*|--crawler=*) EXTRA+=("$1"); shift ;;
+        --format|--max-chars|--max-images) EXTRA+=("$1" "$2"); shift 2 ;;
+        --format=*|--max-chars=*|--max-images=*) EXTRA+=("$1"); shift ;;
+        # Category flags pass through to searx
+        --it|--science|--packages|--repos|--qa|--videos|--images|--wiki|--books|--social|--weather|--map)
+            EXTRA+=("$1"); shift ;;
+        *)
+            if [ -z "$QUERY" ]; then
+                QUERY="$1"; shift
+            else
+                EXTRA+=("$1"); shift
+            fi
+            ;;
+    esac
+done
+
+# Helper: choose search function based on --no-rerank flag
+run_search() {
+    if [ "$NO_RERANK" = "true" ]; then
+        do_search "$@"
+    else
+        do_search_reranked "$@"
+    fi
+}
+
+case "$CMD" in
+    search)
+        [ -z "$QUERY" ] && usage
+        run_search "$QUERY" "${EXTRA[@]}"
+        ;;
+    fetch)
+        [ -z "$QUERY" ] && usage
+        do_fetch "$QUERY"
+        ;;
+    extract|full)
+        [ -z "$QUERY" ] && usage
+        do_extract "$QUERY" "${EXTRA[@]}"
+        ;;
+    vision|extract-images)
+        [ -z "$QUERY" ] && usage
+        if command -v web-extract &>/dev/null; then
+            web-extract "$QUERY" --vision "${EXTRA[@]}" && exit $?
+        fi
+        echo "⚠️  web-extract not available" >&2
+        exit 1
+        ;;
+    news)
+        [ -z "$QUERY" ] && usage
+        run_search "$QUERY" --news "${EXTRA[@]}"
+        ;;
+    deep)
+        [ -z "$QUERY" ] && usage
+        # deep: search + read top 5 full text with web-extract
+        echo "🔍 深度搜索: $QUERY"
+        echo ""
+
+        deep_tmp=$(mktemp /tmp/web_deep.XXXXXX)
+        _WEB_TMPFILES+=("$deep_tmp")
+
+        deep_raw_args=()
+        ds=false
+        for a in "${EXTRA[@]}"; do
+            if [ "$ds" = "true" ]; then ds=false; continue; fi
+            if [ "$a" = "--count" ]; then ds=true; continue; fi
+            deep_raw_args+=("$a")
+        done
+        deep_raw_args+=("--count" "5" "--raw")
+
+        if timeout "$SEARX_TIMEOUT" "$SEARX_BIN" "$QUERY" --it "${deep_raw_args[@]}" > "$deep_tmp" 2>/dev/null; then
+            urls=$(python3 -c "
+import json,sys
+data = json.load(open('$deep_tmp'))
+for r in data.get('results',[])[:5]:
+    print(r.get('url',''))
+" 2>/dev/null)
+
+            # Format search results
+            cat "$deep_tmp" | rerank_results "$QUERY" 2>/dev/null | format_reranked_output "$QUERY" "5" 2>/dev/null || python3 -c "
+import json
+data = json.load(open('$deep_tmp'))
+for i,r in enumerate(data.get('results',[])[:5],1):
+    print(f'[{i}] {r.get(\"title\",\"\")}')
+    print(f'    URL: {r.get(\"url\",\"\")}')
+    print(f'    {r.get(\"content\",\"\")[:200]}')
+    print()
+" 2>/dev/null
+
+            # Phase 2: fully extract each result
+            if [ -n "$urls" ] && command -v web-extract &>/dev/null; then
+                echo "═══ 全文提取 ═══"
+                idx=1
+                while IFS= read -r url; do
+                    [ -z "$url" ] && continue
+                    echo ""
+                    echo "─── [$idx] ───"
+                    web-extract "$url" --max-chars 8000 2>/dev/null || echo "⚠️ 提取失败"
+                    idx=$((idx + 1))
+                done <<< "$urls"
+            fi
+        else
+            echo "⚠️ 搜索失败，降级到 do_search"
+            do_search "$QUERY" --deep --it "${EXTRA[@]}"
+        fi
+        ;;
+    synthesize)
+        [ -z "$QUERY" ] && usage
+        if command -v web-synthesize &>/dev/null; then
+            web-synthesize --from-deep "$QUERY" --max-chars "${SYNTHESIZE_CHARS:-4000}" "${EXTRA[@]}" && exit $?
+        fi
+        echo "⚠️  web-synthesize not available" >&2
+        echo "👉 FALLBACK: use web deep instead" >&2
+        exit 1
+        ;;
+    it)
+        [ -z "$QUERY" ] && usage
+        run_search "$QUERY" --it "${EXTRA[@]}"
+        ;;
+    science)
+        [ -z "$QUERY" ] && usage
+        run_search "$QUERY" --science "${EXTRA[@]}"
+        ;;
+    packages)
+        [ -z "$QUERY" ] && usage
+        run_search "$QUERY" --packages "${EXTRA[@]}"
+        ;;
+    repos)
+        [ -z "$QUERY" ] && usage
+        run_search "$QUERY" --repos "${EXTRA[@]}"
+        ;;
+    qa)
+        [ -z "$QUERY" ] && usage
+        run_search "$QUERY" --qa "${EXTRA[@]}"
+        ;;
+    videos)
+        [ -z "$QUERY" ] && usage
+        run_search "$QUERY" --videos "${EXTRA[@]}"
+        ;;
+    images)
+        [ -z "$QUERY" ] && usage
+        run_search "$QUERY" --images "${EXTRA[@]}"
+        ;;
+    probe)
+        probe_full
+        ;;
+    gh)
+        [ -z "$QUERY" ] && usage
+        gh "$QUERY" "${EXTRA[@]}" 2>/dev/null || {
+            echo "⚠️  gh CLI failed"
+            echo "👉 FALLBACK: Use searx or WebFetch"
+            exit 2
+        }
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        if [[ "$CMD" =~ ^https?:// ]]; then
+            do_fetch "$CMD"
+        else
+            do_search "$CMD $QUERY" "${EXTRA[@]}"
+        fi
+        ;;
+esac

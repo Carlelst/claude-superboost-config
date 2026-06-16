@@ -1,0 +1,150 @@
+#!/bin/bash
+# ============================================================
+# rerank — BGE-Reranker-v2-m3 搜索结果重排序
+# ============================================================
+# Usage:
+#   rerank "<query>" < input.json
+#   rerank "<query>" --file results.json
+#   rerank "<query>" --top 5 < input.json
+#
+# Input:  {"results": [{"title":"...", "url":"...", "content":"..."}, ...]}
+# Output: 重排序 JSON（含 rerank_score, rerank_rank）
+# ============================================================
+
+set -euo pipefail
+
+RERANK_URL="${RERANK_URL:-http://172.16.90.45:8082}"
+RERANK_MODEL="${RERANK_MODEL:-scs_bge-reranker}"
+RERANK_THRESHOLD="${RERANK_THRESHOLD:-0.05}"
+
+if [ $# -eq 0 ]; then
+    cat <<'HELP'
+rerank — BGE-Reranker-v2-m3 搜索结果重排序
+
+Usage:
+  rerank "<query>"                    # stdin JSON
+  rerank "<query>" --file f.json      # 文件输入
+  rerank "<query>" --top 5            # 只返回 top 5
+
+Input:  {"results": [{"title":"...", "url":"...", "content":"..."}, ...]}
+Output: 重排序 JSON（含 rerank_score, rerank_rank, latency）
+
+Env: RERANK_URL | RERANK_MODEL | RERANK_THRESHOLD
+HELP
+    exit 1
+fi
+
+QUERY="$1"; shift
+INPUT_FILE=""
+TOP_N=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --file) shift; INPUT_FILE="$1" ;;
+        --top) shift; TOP_N="$1" ;;
+    esac
+    shift
+done
+
+if [ -n "$INPUT_FILE" ]; then
+    INPUT=$(cat "$INPUT_FILE")
+else
+    INPUT=$(cat)
+fi
+
+# Pass input via temp file to avoid shell quoting issues
+TMPFILE=$(mktemp)
+echo "$INPUT" > "$TMPFILE"
+trap "rm -f $TMPFILE" EXIT
+
+python3 - "$QUERY" "$RERANK_URL" "$RERANK_MODEL" "$RERANK_THRESHOLD" "$TOP_N" "$TMPFILE" << 'PYEOF'
+import sys, json, time, math, urllib.request
+
+query = sys.argv[1]
+rerank_url = sys.argv[2]
+model = sys.argv[3]
+threshold = float(sys.argv[4])
+top_n = int(sys.argv[5]) if sys.argv[5] else 0
+input_file = sys.argv[6]
+
+with open(input_file) as f:
+    input_data = json.load(f)
+
+results = input_data.get("results", [])
+if not results:
+    print(json.dumps({"results": [], "reranked": True, "model": model}))
+    sys.exit(0)
+
+# Build items: title + content (truncated to 500 chars)
+items = []
+for r in results:
+    text = f"{r.get('title', '')} {r.get('content', '')}"
+    items.append(text[:500])
+
+# Call BGE-Reranker via vLLM score API
+payload = json.dumps({
+    "model": model,
+    "queries": [query],
+    "items": items
+}).encode()
+
+start = time.time()
+try:
+    req = urllib.request.Request(
+        f"{rerank_url}/v1/score",
+        data=payload,
+        headers={"Content-Type": "application/json"})
+    resp = urllib.request.urlopen(req, timeout=15)
+    elapsed = time.time() - start
+    data = json.loads(resp.read())
+except Exception as e:
+    print(f"⚠️  Reranker API error: {e}", file=sys.stderr)
+    for i, r in enumerate(results):
+        r["rerank_score"] = None
+        r["rerank_rank"] = i + 1
+    print(json.dumps({"results": results, "reranked": False,
+                       "error": str(e)}, ensure_ascii=False, indent=2))
+    sys.exit(1)
+
+# Parse scores (sorted by index)
+raw_scores = [0.0] * len(items)
+for item in data.get("data", []):
+    idx = item.get("index", 0)
+    if idx < len(raw_scores):
+        raw_scores[idx] = item.get("score", 0)
+
+# Normalize to 0-1 via sigmoid
+def sigmoid(x):
+    return 1 / (1 + math.exp(-max(-500, min(500, x))))
+
+norm_scores = [sigmoid(s) for s in raw_scores]
+
+# Sort by score, filter by threshold
+scored = list(enumerate(norm_scores))
+scored.sort(key=lambda x: x[1], reverse=True)
+
+reranked = []
+for idx, score in scored:
+    if score < threshold:
+        continue
+    r = results[idx].copy()
+    r["rerank_score"] = round(score, 4)
+    r["rerank_raw_score"] = round(raw_scores[idx], 4)
+    r["rerank_rank"] = len(reranked) + 1
+    reranked.append(r)
+
+if top_n > 0:
+    reranked = reranked[:top_n]
+
+output = {
+    "results": reranked,
+    "reranked": True,
+    "model": model,
+    "latency_s": round(elapsed, 3),
+    "threshold": threshold,
+    "total_input": len(results),
+    "total_output": len(reranked),
+    "filtered": len(results) - len(reranked)
+}
+print(json.dumps(output, ensure_ascii=False, indent=2))
+PYEOF

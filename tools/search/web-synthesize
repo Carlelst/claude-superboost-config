@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+# ============================================================
+# web-synthesize — MapReduce content synthesis
+# ============================================================
+# Two modes:
+#   MODE A: Single large page → chunk → map → reduce
+#   MODE B: Multi-URL aggregation → map each → reduce cross-page
+#
+# Usage:
+#   web-synthesize --urls URL1 URL2 ...     Multi-page synthesis
+#   web-synthesize --url URL --chunked      Single large page chunked
+#   web-synthesize --from-deep <query>      Search + deep synthesis
+#
+# Architecture:
+#   ┌──────────────────────────────────────────────────┐
+#   │                    INPUT                          │
+#   │  Single URL (large)     │   Multiple URLs         │
+#   └────────┬────────────────┴──────┬─────────────────┘
+#            │                       │
+#     ┌──────▼──────┐         ┌──────▼──────┐
+#     │ FETCH +      │         │ FETCH each  │
+#     │ EXTRACT      │         │ + EXTRACT   │
+#     │ (full text)  │         │ (per-page)  │
+#     └──────┬──────┘         └──────┬──────┘
+#            │                       │
+#     ┌──────▼──────┐         ┌──────▼──────┐
+#     │ SPLIT into   │         │ PAGE-LEVEL  │
+#     │ ~4000-char   │         │ SUMMARIZE   │
+#     │ chunks       │         │ (each ≤ 2k) │
+#     └──────┬──────┘         └──────┬──────┘
+#            │                       │
+#     ┌──────▼──────┐                │
+#     │ MAP: summarize│              │
+#     │ each chunk   │               │
+#     │ (in parallel)│               │
+#     └──────┬──────┘                │
+#            │                       │
+#            └───────────┬───────────┘
+#                        │
+#                 ┌──────▼──────┐
+#                 │   REDUCE:   │
+#                 │  synthesize │
+#                 │  chunk/page  │
+#                 │  summaries   │
+#                 │  → 1 report  │
+#                 └──────┬──────┘
+#                        │
+#                 ┌──────▼──────┐
+#                 │   OUTPUT    │
+#                 │ structured  │
+#                 │ markdown    │
+#                 └─────────────┘
+# ============================================================
+
+import sys, os, re, json, time, argparse, traceback
+from urllib.request import Request, urlopen
+from urllib.parse import quote, urljoin
+
+# ── Config ──────────────────────────────────────────────
+LLM_PROXY = os.environ.get("LLM_PROXY", "http://172.16.90.45:8082")
+MAP_MODEL = os.environ.get("WEB_MAP_MODEL", "deepseek-v4-pro")
+REDUCE_MODEL = os.environ.get("WEB_REDUCE_MODEL", "deepseek-v4-pro")
+MAP_MAX_INPUT = int(os.environ.get("WEB_MAP_MAX_INPUT", "4000"))
+MAP_DELAY = float(os.environ.get("WEB_MAP_DELAY", "0"))  # seconds between map calls (0 for deepseek)
+CHUNK_SIZE = int(os.environ.get("WEB_CHUNK_SIZE", "4000"))
+CHUNK_OVERLAP = int(os.environ.get("WEB_CHUNK_OVERLAP", "200"))
+TIMEOUT = int(os.environ.get("WEB_TIMEOUT", "15"))
+
+
+def log(msg: str):
+    print(f"  {msg}", file=sys.stderr)
+
+
+# ── LLM call ─────────────────────────────────────────────
+
+def call_llm(prompt: str, model: str, max_tokens: int = 2000,
+             temperature: float = 0.2, system: str = "", retries: int = 2) -> str:
+    """Unified LLM call with retry."""
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    for attempt in range(retries + 1):
+        try:
+            req = Request(
+                f"{LLM_PROXY}/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"})
+            with urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read())
+                content = result["choices"][0]["message"]["content"]
+                if content and len(content.strip()) > 20:
+                    return content
+        except Exception as e:
+            log(f"LLM failed ({model}, attempt {attempt+1}/{retries+1}): {e}")
+            if attempt < retries:
+                import time as _t
+                _t.sleep(2 ** attempt)  # exponential backoff
+    return ""
+
+
+# ── Fetch + extract ──────────────────────────────────────
+
+def fetch_and_extract(url: str) -> tuple[str, str]:
+    """Fetch URL, extract text. Returns (text, title)."""
+    SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://192.168.20.21:8005")
+
+    html = ""
+    # 1. SearXNG proxy
+    try:
+        encoded = quote(url, safe='')
+        data = f"q=:url:{encoded}&format=json".encode()
+        req = Request(SEARXNG_URL + "/search", data=data,
+                      headers={"X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1"})
+        with urlopen(req, timeout=12) as resp:
+            result = json.loads(resp.read())
+            for r in result.get("results", []):
+                raw = r.get("raw_content", "") or r.get("_raw", "")
+                if raw and len(raw) > 200:
+                    html = raw
+                    break
+    except Exception:
+        pass
+
+    # 2. Direct
+    if not html:
+        try:
+            req = Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+            })
+            with urlopen(req, timeout=TIMEOUT) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            return "", f"(fetch failed: {e})"
+
+    # Extract text
+    text = ""
+    try:
+        import trafilatura
+        text = trafilatura.extract(
+            html,
+            output_format='markdown',
+            favor_precision=True,
+            include_tables=True,
+            include_images=False,
+            include_links=True,
+            deduplicate=True,
+            with_metadata=False,
+            target_language='auto',
+        )
+    except Exception:
+        pass
+
+    if not text:
+        import re as _re
+        _re.sub(r'<(script|style|noscript|iframe|svg)[^>]*>.*?</\1>', '', html, flags=_re.DOTALL | _re.I)
+        text = _re.sub(r'\s+', ' ', text).strip()
+
+    # Extract title
+    title = url
+    m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
+    if m:
+        title = m.group(1).strip()
+
+    return text or "", title
+
+
+# ── Chunking ─────────────────────────────────────────────
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE,
+               overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Split text into overlapping chunks, respecting paragraph boundaries."""
+    paragraphs = text.split('\n\n')
+    chunks = []
+    current = ""
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if len(current) + len(para) + 2 > chunk_size and current:
+            chunks.append(current)
+            # Keep last `overlap` chars for context
+            if overlap > 0 and len(current) > overlap:
+                current = current[-overlap:] + "\n\n" + para
+            else:
+                current = para
+        else:
+            current = current + ("\n\n" + para if current else para)
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+# ── Map: summarize each chunk/page ───────────────────────
+
+def map_summarize(chunk: str, idx: int, total: int,
+                  context: str = "") -> str:
+    """Summarize one chunk or one page.
+
+    Caps input at MAP_MAX_INPUT to avoid kimi-k2.6 upstream drops.
+    """
+    kind = "page" if context else "chunk"
+    system = (
+        "You are a technical content summarizer. Extract all key facts, "
+        "technical details, API names, version numbers, code patterns, "
+        "architectural decisions, and data. Output in Chinese with "
+        "structured markdown (headings, bullets, code blocks where appropriate). "
+        "Be comprehensive — this is an intermediate summary that will be "
+        "further synthesized."
+    )
+
+    # Cap input to avoid upstream drops
+    content = chunk[:MAP_MAX_INPUT]
+    ctx_line = f"\nSource context: {context}\n" if context else ""
+    prompt = (
+        f"{kind.capitalize()} {idx}/{total}. "
+        f"Summarize the key information below. "
+        f"Focus on: facts, code patterns, API references, data, decisions.\n"
+        f"{ctx_line}"
+        f"Content:\n{content}"
+    )
+
+    return call_llm(prompt, MAP_MODEL, max_tokens=1500, temperature=0.2, system=system)
+
+
+# ── Reduce: synthesize summaries ─────────────────────────
+
+def reduce_synthesize(summaries: list[dict], title: str, total_source_size: int) -> str:
+    """Synthesize multiple chunk/page summaries into one report.
+
+    Cap the combined prompt at 6000 chars to avoid upstream timeout.
+    If summaries don't fit, we compact them first, then reduce.
+    """
+    # Build item blocks
+    items = []
+    for s in summaries:
+        items.append(
+            f"### Source {s['idx']}/{s['total']}: {s.get('title', 'untitled')}\n"
+            f"URL: {s.get('url', 'unknown')}\n\n"
+            f"{s['summary']}"
+        )
+
+    combined = "\n\n---\n\n".join(items)
+
+    MAX_COMBINED = 6000  # keep under threshold to avoid upstream drops
+    if len(combined) > MAX_COMBINED:
+        # Trim each summary proportionally
+        per_item = max(400, MAX_COMBINED // len(items))
+        trimmed = []
+        for i, item in enumerate(items):
+            if len(item) > per_item:
+                # Keep head + tail for context
+                trimmed.append(item[:per_item * 3 // 4] + f"\n... (trimmed)")
+            else:
+                trimmed.append(item)
+        combined = "\n\n---\n\n".join(trimmed)
+        combined = combined[:MAX_COMBINED]
+
+    system = (
+        "You are a senior technical analyst. Synthesize multiple source summaries "
+        "into a single, well-structured report. Identify cross-cutting themes, "
+        "conflicts, gaps, and unique insights from each source. Do NOT just "
+        "concatenate — find the narrative. Output in Chinese with clear markdown "
+        "structure (H1 title, H2 sections, tables for comparisons, bullet lists "
+        "for feature breakdowns, code blocks for critical examples). "
+        "Include a comparison table if there are 2+ sources with competing approaches."
+    )
+
+    prompt = (
+        f"Topic: {title}\n"
+        f"Sources: {len(summaries)} items, {total_source_size:,} chars raw\n\n"
+        f"Synthesize into a comprehensive tech report. Include:\n"
+        f"1. Executive summary\n"
+        f"2. Key findings by theme\n"
+        f"3. Comparison table if applicable\n"
+        f"4. Critical code/config examples\n"
+        f"5. Gaps or contradictions\n\n"
+        f"Source summaries:\n{combined}"
+    )
+
+    result = call_llm(prompt, REDUCE_MODEL, max_tokens=3000, temperature=0.3, system=system)
+    return result or "Reduce failed — partial output available in map summaries."
+
+
+# ── Main pipeline ────────────────────────────────────────
+
+def synthesize_single_page(url: str, max_output_chars: int) -> dict:
+    """Mode A: large single page → chunk → map → reduce."""
+    log(f"Mode A: single-page synthesis")
+
+    # Fetch
+    log(f"📡 Fetching: {url}")
+    t0 = time.time()
+    text, title = fetch_and_extract(url)
+    if not text:
+        return {"error": f"Failed to extract from {url}", "text_len": 0}
+    log(f"   Extracted: {len(text):,} chars ({time.time()-t0:.1f}s)")
+
+    # If text is small enough, return directly (no synthesis needed)
+    if len(text) <= max_output_chars * 2:
+        log(f"   Text fits in {max_output_chars:,} chars — no chunking needed")
+        return {
+            "title": title,
+            "url": url,
+            "text": text[:max_output_chars],
+            "text_len": len(text),
+            "chunks": 0,
+            "mode": "direct",
+        }
+
+    # Chunk
+    chunks = chunk_text(text)
+    log(f"   Split into {len(chunks)} chunks (~{CHUNK_SIZE:,} chars each)")
+
+    # Map: summarize each chunk
+    summaries = []
+    for i, chunk in enumerate(chunks, 1):
+        log(f"   Map {i}/{len(chunks)}: summarizing chunk ({len(chunk):,} chars)")
+        t1 = time.time()
+        summary = map_summarize(chunk, i, len(chunks))
+        if summary:
+            summaries.append({
+                "idx": i, "total": len(chunks),
+                "title": title, "url": url,
+                "summary": summary,
+            })
+            log(f"     → {len(summary):,} chars ({time.time()-t1:.1f}s)")
+        else:
+            log(f"     → failed")
+        if i < len(chunks):
+            time.sleep(MAP_DELAY)  # rate-limit gap between calls
+
+    if not summaries:
+        return {"error": f"All chunk summaries failed for {url}", "text_len": len(text)}
+
+    # Reduce: synthesize all chunk summaries
+    log(f"   Reduce: synthesizing {len(summaries)} chunk summaries")
+    t1 = time.time()
+    report = reduce_synthesize(summaries, title, len(text))
+    log(f"     → {len(report):,} chars ({time.time()-t1:.1f}s)")
+
+    log(f"✅ Single-page done ({time.time()-t0:.1f}s): {len(text):,} → {len(report):,} chars")
+
+    return {
+        "title": title,
+        "url": url,
+        "text": report[:max_output_chars],
+        "text_len": len(text),
+        "chunks": len(chunks),
+        "mode": "chunked",
+    }
+
+
+def synthesize_multi_page(urls: list[str], max_output_chars: int) -> dict:
+    """Mode B: multiple pages → extract each → summarize each → reduce."""
+    log(f"Mode B: multi-page synthesis ({len(urls)} URLs)")
+
+    t0 = time.time()
+    total_raw = 0
+
+    # Phase 1: Fetch + extract all
+    pages = []
+    for i, url in enumerate(urls, 1):
+        log(f"📡 [{i}/{len(urls)}] Fetching: {url[:80]}...")
+        t1 = time.time()
+        text, title = fetch_and_extract(url)
+        if text:
+            pages.append({"idx": i, "url": url, "title": title, "text": text})
+            total_raw += len(text)
+            log(f"     {len(text):,} chars ({time.time()-t1:.1f}s)")
+        else:
+            log(f"     skipped (no content)")
+
+    if not pages:
+        return {"error": "No pages extracted", "text_len": 0}
+
+    # Phase 2: Per-page summarize (map)
+    summaries = []
+    per_page_budget = max(800, max_output_chars // max(len(pages), 2))
+    for p in pages:
+        log(f"   Map {p['idx']}/{len(pages)}: summarizing {p['title'][:60]}")
+        t1 = time.time()
+
+        if len(p["text"]) <= per_page_budget * 2:
+            # Small page — just truncate
+            summary = p["text"][:per_page_budget]
+        else:
+            summary = map_summarize(
+                p["text"], p["idx"], len(pages),
+                context=p["url"]
+            )
+
+        if summary:
+            summaries.append({
+                "idx": p["idx"], "total": len(pages),
+                "title": p["title"], "url": p["url"],
+                "summary": summary,
+            })
+            log(f"     → {len(summary):,} chars ({time.time()-t1:.1f}s)")
+        else:
+            log(f"     → failed")
+
+    if not summaries:
+        return {"error": "All page summaries failed", "text_len": total_raw}
+
+    # Phase 3: Reduce across all pages
+    log(f"   Reduce: cross-page synthesis ({len(summaries)} sources)")
+    t1 = time.time()
+    topic = " / ".join(s["title"][:40] for s in summaries[:3])
+    report = reduce_synthesize(summaries, topic, total_raw)
+    log(f"     → {len(report):,} chars ({time.time()-t1:.1f}s)")
+
+    log(f"✅ Multi-page done ({time.time()-t0:.1f}s): {total_raw:,} → {len(report):,} chars")
+
+    return {
+        "title": topic,
+        "source_count": len(urls),
+        "text": report[:max_output_chars],
+        "text_len": total_raw,
+        "mode": "multi",
+    }
+
+
+# ── Deep search integration ───────────────────────────────
+
+def synthesize_deep(query: str, max_output_chars: int) -> dict:
+    """Search + fetch top N pages + synthesize."""
+    import subprocess
+
+    log(f"🔍 Searching: {query}")
+    # Use web search (text output) and parse URLs from the result
+    result = subprocess.run(
+        ["web", "search", query, "--count", "5"],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0 or not result.stdout.strip():
+        # Fallback: try searx directly
+        result = subprocess.run(
+            ["searx", query, "--count", "5", "--raw"],
+            capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout)
+                urls = [r["url"] for r in data.get("results", [])[:5] if r.get("url")]
+            except Exception:
+                urls = []
+        else:
+            urls = []
+    else:
+        # Parse URLs from formatted text output
+        urls = re.findall(r'URL:\s*(https?://\S+)', result.stdout)[:5]
+
+    if not urls:
+        return {"error": f"No search results for: {query}"}
+
+    log(f"   Found {len(urls)} results")
+    return synthesize_multi_page(urls, max_output_chars)
+
+
+# ── Main ──────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="MapReduce content synthesis (single large page or multi-page)")
+    parser.add_argument("--url", help="Single URL (chunked mode)")
+    parser.add_argument("--urls", nargs="+", help="Multiple URLs")
+    parser.add_argument("--from-deep", help="Search query → deep synthesis")
+    parser.add_argument("--max-chars", type=int, default=4000,
+                        help="Target output length (default 4000)")
+    parser.add_argument("--raw", action="store_true",
+                        help="Output raw JSON result")
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
+                        help=f"Chunk size for single-page mode (default {CHUNK_SIZE})")
+    args = parser.parse_args()
+
+    t0 = time.time()
+
+    if args.from_deep:
+        result = synthesize_deep(args.from_deep, args.max_chars)
+    elif args.urls:
+        result = synthesize_multi_page(args.urls, args.max_chars)
+    elif args.url:
+        result = synthesize_single_page(args.url, args.max_chars)
+    else:
+        parser.error("One of --url, --urls, or --from-deep is required")
+
+    if args.raw:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        if "error" in result:
+            print(f"❌ {result['error']}", file=sys.stderr)
+            sys.exit(1)
+        print(result.get("text", ""))
+        print(f"\n\n---")
+        meta = (
+            f"📊 合成报告 | 模式: {result.get('mode','?')} | "
+            f"原始: {result.get('text_len',0):,} 字符 | "
+            f"耗时: {time.time()-t0:.1f}s"
+        )
+        if result.get('chunks'):
+            meta += f" | 分块: {result['chunks']}"
+        if result.get('source_count'):
+            meta += f" | 源: {result['source_count']} 篇"
+        print(meta)
+
+
+if __name__ == "__main__":
+    main()

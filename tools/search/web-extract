@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+# ============================================================
+# web-extract — Full web page extraction (text + vision)
+# ============================================================
+# Usage:
+#   web-extract <url>                     Text + auto image descriptions (normal mode)
+#   web-extract <url> --mode quick        Quick overview (~800 chars, code preserved)
+#   web-extract <url> --mode normal       Balanced extraction (default, 2-4K chars)
+#   web-extract <url> --mode deep         Full extraction, no truncation (8K+ chars)
+#   web-extract <url> --no-vision         Text only (fast path)
+#   web-extract <url> --max-images N      Limit images (default 5)
+#   web-extract <url> --format text       Plain text output
+#   web-extract <url> --raw-html          Dump raw HTML
+#   web-extract <url> --crawler jina      Use Jina AI Reader (URL → clean Markdown)
+#
+# Pipeline:
+#   1. Fetch (4-tier: Jina AI Reader → SearXNG proxy → direct curl → raw)
+#   2. Extract text (trafilatura → readability → html2text → raw)
+#   3. Find meaningful images in HTML
+#   4. Download + describe via Kimi k2.6 multimodal (optional)
+#   5. Quality-gated compression (extractive → abstractive with code preservation)
+#   6. Merge → rich markdown output
+#
+# Dependencies:
+#   trafilatura, readability-lxml, pandoc, html2text
+#   Kimi k2.6 at LLM_PROXY (default http://172.16.90.45:8082)
+#   Jina AI Reader: free, no API key, JS-rendered page support
+# ============================================================
+
+import sys, os, re, json, base64, time, argparse, subprocess, shutil
+from urllib.parse import urljoin, urlparse, quote
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+
+# ── Config ──────────────────────────────────────────────
+SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://192.168.20.21:8005")
+LLM_PROXY = os.environ.get("LLM_PROXY", "http://172.16.90.45:8082")
+VISION_MODEL = os.environ.get("WEB_VISION_MODEL", "kimi-k2.6")
+SUMMARY_MODEL = os.environ.get("WEB_SUMMARY_MODEL", "deepseek-v4-pro")
+TIMEOUT = int(os.environ.get("WEB_TIMEOUT", "15"))
+DEFAULT_MAX_CHARS = 4000  # normal mode default
+DEFAULT_MAX_IMAGES = 5
+IMAGE_MIN_BYTES = 200
+IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+
+def log(msg: str):
+    print(f"  {msg}", file=sys.stderr)
+
+
+# ── Fetch (4-tier) ─────────────────────────────────────────
+
+JINA_READER_URL = os.environ.get("JINA_READER_URL", "https://r.jina.ai")
+
+
+def fetch_via_jina(url: str) -> tuple[str, str]:
+    """Fetch clean Markdown via Jina AI Reader. Free, JS-rendered, no API key."""
+    try:
+        jina_url = f"{JINA_READER_URL}/{url}"
+        req = Request(jina_url, headers={
+            "Accept": "text/markdown",
+            "X-Return-Format": "markdown",
+            "User-Agent": "Mozilla/5.0 (compatible; WebExtract/1.0)"
+        })
+        with urlopen(req, timeout=30) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+            if content and len(content.strip()) > 100:
+                # Strip Jina's header/footer metadata section to keep it clean
+                # Jina prefixes with "URL: ... Markdown Content:" — keep everything
+                return content, "jina"
+    except Exception:
+        pass
+    return "", "jina-failed"
+
+
+def fetch_html_raw(url: str) -> tuple[str, str]:
+    """Fetch raw HTML via SearXNG proxy or direct."""
+    # 1. SearXNG proxy
+    try:
+        encoded = quote(url, safe='')
+        data = f"q=:url:{encoded}&format=json".encode()
+        req = Request(SEARXNG_URL + "/search", data=data,
+                      headers={"X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1"})
+        with urlopen(req, timeout=12) as resp:
+            result = json.loads(resp.read())
+            for r in result.get("results", []):
+                raw = r.get("raw_content", "") or r.get("_raw", "")
+                if raw and len(raw) > 200:
+                    return raw, "SearXNG"
+    except Exception:
+        pass
+
+    # 2. Direct curl
+    try:
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+        })
+        with urlopen(req, timeout=TIMEOUT) as resp:
+            return resp.read().decode("utf-8", errors="replace"), "direct"
+    except Exception:
+        return "", "failed"
+
+
+def fetch_html(url: str, prefer_jina: bool = True) -> tuple[str, str]:
+    """4-tier fetch. Returns (content, source).
+
+    Tier 1: Jina AI Reader (clean Markdown, JS-rendered, free)
+    Tier 2: SearXNG proxy (cached, good IP reputation)
+    Tier 3: Direct HTTP (raw HTML)
+    Tier 4: Failed
+    """
+    if prefer_jina:
+        content, source = fetch_via_jina(url)
+        if content:
+            return content, source
+
+    content, source = fetch_html_raw(url)
+    if content:
+        return content, source
+
+    # Last resort: try Jina even if prefer_jina was False
+    if not prefer_jina:
+        content, source = fetch_via_jina(url)
+        if content:
+            return content, source
+
+    return "", "failed"
+
+
+# ── Text extraction ──────────────────────────────────────
+
+def extract_text(html: str, fmt: str = "md", source: str = "unknown") -> tuple[str, str]:
+    """trafilatura → readability → html2text → raw. Returns (text, source).
+
+    If source is 'jina', the content is already clean Markdown — skip HTML extraction.
+    """
+    if source == "jina":
+        # Jina delivers ready-to-use Markdown. Clean up the metadata header.
+        text = html.strip()
+        # Remove Jina's URL/Markdown Content/Title header section
+        text = re.sub(r'^.*?Markdown Content:\s*\n+', '', text, flags=re.DOTALL)
+        # Also remove the final "Page generated by Jina..." footer
+        text = re.sub(r'\n*(> )?Source:.*$', '', text)
+        if len(text) > 50:
+            return text, "jina"
+        return html, "jina"
+
+    # Layer 1: trafilatura
+    try:
+        import trafilatura
+        result = trafilatura.extract(
+            html,
+            output_format='markdown' if fmt == 'md' else 'text',
+            favor_precision=True,
+            include_comments=False,
+            include_tables=True,
+            include_images=True,
+            include_links=True,
+            deduplicate=True,
+            with_metadata=True,
+            target_language='auto',
+        )
+        if result and len(result.strip()) > 100:
+            return result, "trafilatura"
+    except Exception:
+        pass
+
+    # Layer 2: readability-lxml → pandoc for markdown
+    try:
+        from readability import Document
+        doc = Document(html)
+        title = doc.title()
+        content = doc.summary()
+        if content and len(content.strip()) > 100:
+            if fmt == 'text':
+                content = re.sub(r'<[^>]+>', '', content)
+                content = '\n\n'.join(l.strip() for l in content.split('\n') if l.strip())
+                if title:
+                    content = f"{title}\n\n{content}"
+            elif shutil.which('pandoc'):
+                r = subprocess.run(
+                    ['pandoc', '-f', 'html', '-t', 'markdown_strict', '--wrap=none', '--no-highlight'],
+                    input=content.encode(), capture_output=True, timeout=10)
+                if r.returncode == 0 and r.stdout.strip():
+                    content = r.stdout.decode().strip()
+                    if title:
+                        content = f"# {title}\n\n{content}"
+            if len(content.strip()) > 100:
+                return content, "readability"
+    except Exception:
+        pass
+
+    # Layer 3: html2text
+    try:
+        r = subprocess.run(['html2text', '-utf8', '-nobs'],
+                           input=html.encode(), capture_output=True, timeout=10)
+        if r.returncode == 0 and len(r.stdout.strip()) > 100:
+            return r.stdout.decode("utf-8", errors="replace"), "html2text"
+    except Exception:
+        pass
+
+    # Layer 4: raw
+    text = re.sub(r'<(script|style|noscript|iframe|svg)[^>]*>.*?</\1>', '', html, flags=re.DOTALL | re.I)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return '\n\n'.join(l.strip() for l in text.split('\n') if l.strip()), "raw"
+
+
+# ── Image discovery ──────────────────────────────────────
+
+def find_images(html: str, base_url: str) -> list[dict]:
+    """Find meaningful <img> tags. Returns list of {url, alt}."""
+    skip_patterns = [
+        'pixel', 'tracking', 'beacon', 'spacer',
+        'favicon', 'icon-16', 'icon-32', 'icon-48',
+        'logo-16', 'logo-32',
+    ]
+
+    images = []
+    for tag in re.findall(r'<img[^>]+>', html, re.I):
+        src_m = re.search(r'src\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+        alt_m = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', tag, re.I)
+        if not src_m:
+            continue
+        src = src_m.group(1).strip()
+        alt = (alt_m.group(1) or '').strip() if alt_m else ''
+
+        # Resolve relative URLs
+        if src.startswith('//'):
+            src = 'https:' + src
+        elif src.startswith('/') or not src.startswith('http'):
+            src = urljoin(base_url, src)
+        if not src.startswith('http'):
+            continue
+
+        # Skip SVG
+        if '.svg' in src.lower():
+            continue
+        # Skip tiny data URIs
+        if src.startswith('data:') and len(src) < 500:
+            continue
+
+        # Skip tracking/icon patterns
+        skip = False
+        for sp in skip_patterns:
+            if sp in src.lower() or sp in alt.lower():
+                skip = True
+                break
+        if skip:
+            continue
+
+        images.append({"url": src, "alt": alt})
+
+    # Deduplicate by URL
+    seen = set()
+    unique = []
+    for img in images:
+        if img["url"] not in seen:
+            seen.add(img["url"])
+            unique.append(img)
+    return unique
+
+
+def download_images(images: list[dict], max_n: int) -> list[dict]:
+    """Download images, return those with valid base64 data URIs."""
+    downloaded = []
+    for img in images[:max_n]:
+        try:
+            req = Request(img["url"],
+                          headers={"User-Agent": "Mozilla/5.0 (compatible; ImageFetcher/1.0)"})
+            with urlopen(req, timeout=8) as resp:
+                data = resp.read()
+                ct = resp.headers.get("Content-Type", "image/jpeg")
+                if "svg" in ct.lower():
+                    continue
+                if len(data) < IMAGE_MIN_BYTES or len(data) > IMAGE_MAX_BYTES:
+                    continue
+                b64 = base64.b64encode(data).decode()
+                img["data_uri"] = f"data:{ct};base64,{b64}"
+                downloaded.append(img)
+        except Exception:
+            pass
+    return downloaded
+
+
+# ── Vision ────────────────────────────────────────────────
+
+def describe_images(images: list[dict], page_context: str) -> list[dict]:
+    """Send images to vision model, return descriptions."""
+    if not images:
+        return []
+
+    image_content = [
+        {"type": "image_url", "image_url": {"url": img["data_uri"]}}
+        for img in images
+    ]
+
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Page context:\n{page_context[:2000]}\n\n"
+                        f"Describe each image from this page. For each:\n"
+                        f"1. What it shows (one sentence)\n"
+                        f"2. Type: [diagram|chart|screenshot|photo|illustration|table|other]\n"
+                        f"3. Contains info NOT in page text? [yes|no]\n"
+                        f"Be concise. Format: [IMG N] description | type | unique_info: yes/no"
+                    )
+                }
+            ] + image_content
+        }],
+        "max_tokens": 200 * len(images),
+        "temperature": 0.1,
+    }
+
+    try:
+        req = Request(
+            f"{LLM_PROXY}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+            content = result["choices"][0]["message"]["content"]
+    except Exception as e:
+        log(f"vision API error: {e}")
+        return []
+
+    # Parse multi-image response
+    descriptions = []
+    lines = content.strip().split('\n')
+    for i, img in enumerate(images):
+        desc = lines[i] if i < len(lines) else f"[IMG {i+1}] (no description)"
+        # Strip numbering prefixes
+        desc = re.sub(r'^\[?IMAGE\s*\d+\]?\s*', '', desc, flags=re.I)
+        desc = re.sub(r'^\[?IMG\s*\d+\]?\s*', '', desc, flags=re.I)
+        desc = re.sub(r'^\d+[\.\)]\s*', '', desc)
+        descriptions.append({
+            "url": img["url"],
+            "alt": img["alt"],
+            "description": desc.strip(),
+        })
+    return descriptions
+
+
+# ── Quality-gated compression ──────────────────────────────
+
+# Pre-compression patterns: things that MUST survive verbatim
+PROTECTED_PATTERNS = [
+    (r'```[\s\S]*?```', 'code_block'),           # fenced code blocks
+    (r'`[^`\n]+`', 'inline_code'),               # inline code
+    (r'https?://\S+', 'url'),                     # URLs
+    (r'\b\d+\.\d+\.\d+\b', 'version'),            # semver
+    (r'\b[gG][hH]\s+\w+\b', 'gh_cmd'),            # gh commands
+    (r'\b(pip|npm|cargo|go)\s+(install|add|get)\s+\S+', 'pkg_install'),
+]
+
+
+def extract_protected(text: str) -> tuple[str, dict]:
+    """Extract protected snippets, replace with placeholders."""
+    snippets = {}
+    counter = [0]
+
+    def replace_match(m):
+        counter[0] += 1
+        key = f"__PROTECTED_{counter[0]}__"
+        snippets[key] = m.group(0)
+        return f" {key} "
+
+    result = text
+    # Process from longest match first (fenced blocks)
+    for pattern, _ in PROTECTED_PATTERNS:
+        result = re.sub(pattern, replace_match, result)
+
+    return result, snippets
+
+
+def restore_protected(text: str, snippets: dict) -> str:
+    """Put protected snippets back."""
+    result = text
+    for key, value in snippets.items():
+        result = result.replace(key, value)
+    return result
+
+
+def extractive_compress(text: str, max_chars: int) -> str:
+    """Compress text by keeping important lines, dropping filler.
+
+    Strategy: score each paragraph by signal density (code, numbers, links),
+    keep top-N paragraphs that fit in max_chars.
+    """
+    paragraphs = text.split('\n\n')
+    if not paragraphs:
+        return text
+
+    # Score each paragraph
+    scored = []
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+        score = 0
+        score += len(re.findall(r'```|`[^`]+`', p)) * 10          # code
+        score += len(re.findall(r'\b\d{4}\b|\b\d+\.\d+\b', p)) * 5  # numbers/versions
+        score += len(re.findall(r'https?://', p)) * 8               # links
+        score += len(re.findall(r'^#{1,3}\s', p)) * 15              # headings
+        score += len(re.findall(r'^\s*[-*+]\s', p)) * 3             # list items
+        score += len(re.findall(r'\b(API|CLI|SDK|config|install|deploy|docker)\b', p, re.I)) * 8
+        # Penalize very short paragraphs
+        if len(p) < 40:
+            score -= 5
+        scored.append((p, score, len(p)))
+
+    # Sort by score descending, pick until budget
+    scored.sort(key=lambda x: x[1], reverse=True)
+    kept = []
+    used = 0
+    for p, _, plen in scored:
+        if used + plen + 2 > max_chars:
+            break
+        kept.append(p)
+        used += plen + 2  # +2 for \n\n separator
+
+    return '\n\n'.join(kept)
+
+
+def abstractive_compress(text: str, url: str, max_chars: int, preserve_blocks: bool = True) -> str:
+    """LLM compression. If preserve_blocks=True, extract code/URLs/versions first,
+    compress the narrative, then restore blocks.
+    """
+    if preserve_blocks:
+        stripped, snippets = extract_protected(text)
+    else:
+        stripped = text
+        snippets = {}
+
+    # Cap the prompt to avoid upstream drops (deepseek unstable with >15k input)
+    prompt_text = stripped[:14000]
+
+    system = (
+        "You are a technical content compressor. Preserve ALL factual details: "
+        "API names, version numbers, configuration values, command-line flags, "
+        "code logic descriptions, data points. Drop marketing fluff, filler words, "
+        "and redundant explanations. Keep the same language as input (Chinese/English mix is OK). "
+        "Use structured markdown (bullet lists for features, tables for comparisons, "
+        "code blocks only if they appear in PROTECTED tags)."
+    )
+
+    prompt = (
+        f"Source: {url}\n"
+        f"Compress the content below to ≤{max_chars} characters. "
+        f"Rules:\n"
+        f"- Keep all PROTECTED tags verbatim\n"
+        f"- Keep all numbers, versions, API names, package names\n"
+        f"- Drop ads, navigation text, cookie notices, repeated headers\n"
+        f"- If there's a comparison table, keep it\n"
+        f"- If there are code examples, describe what they do, don't copy\n\n"
+        f"Content:\n{prompt_text}"
+    )
+
+    payload = {
+        "model": SUMMARY_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": min(max_chars // 3 + 500, 8000),
+        "temperature": 0.1,
+    }
+
+    try:
+        from urllib.request import Request, urlopen
+        req = Request(
+            f"{LLM_PROXY}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+            compressed = result["choices"][0]["message"]["content"]
+            if compressed and len(compressed.strip()) > 50:
+                return restore_protected(compressed, snippets)
+    except Exception:
+        pass
+
+    return ""
+
+
+def quality_gate(original: str, compressed: str) -> bool:
+    """Verify compressed output retains critical signals."""
+    if not compressed or len(compressed.strip()) < 50:
+        return False
+
+    # Check: do URLs survive?
+    orig_urls = set(re.findall(r'https?://\S+', original))
+    comp_urls = set(re.findall(r'https?://\S+', compressed))
+    url_retention = len(comp_urls) / max(len(orig_urls), 1)
+
+    # Check: do code blocks survive?
+    orig_blocks = len(re.findall(r'```', original)) // 2
+    comp_blocks = len(re.findall(r'```', compressed)) // 2
+    block_retention = comp_blocks / max(orig_blocks, 1) if orig_blocks > 0 else 1.0
+
+    # Check: do version numbers survive?
+    orig_vers = len(re.findall(r'\b\d+\.\d+\.\d+\b', original))
+    comp_vers = len(re.findall(r'\b\d+\.\d+\.\d+\b', compressed))
+    ver_retention = comp_vers / max(orig_vers, 1) if orig_vers > 0 else 1.0
+
+    if url_retention < 0.5 or block_retention < 0.5 or ver_retention < 0.5:
+        return False
+
+    return True
+
+
+# ── Output ────────────────────────────────────────────────
+
+# Mode presets
+MODE_PRESETS = {
+    "quick": {"max_chars": 800, "summarize": True},
+    "normal": {"max_chars": 4000, "summarize": True},
+    "deep": {"max_chars": 12000, "summarize": False},
+}
+
+
+# ── Output ────────────────────────────────────────────────
+
+def format_output(text: str, images: list[dict], url: str,
+                  text_source: str, fetch_source: str, vision_info: str,
+                  max_chars: int, raw: bool, use_summary: bool = False,
+                  mode: str = "normal") -> str:
+    """Merge text + image descriptions + metadata.
+
+    Quality-gated compression pipeline:
+      1. If text fits `max_chars` → output as-is
+      2. If too large → extractive compress (keep high-signal paragraphs)
+      3. If still too large + summarize → abstractive compress (LLM) with code protection
+      4. Quality gate → if failed, fall back to extractive
+      5. Merge images + footer
+    """
+    if raw:
+        clean_images = [{k: v for k, v in img.items() if k != 'data_uri'}
+                        for img in images]
+        result = {
+            "url": url,
+            "text": text,
+            "text_source": text_source,
+            "fetch_source": fetch_source,
+            "images": clean_images,
+            "vision": vision_info,
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    img_block = ""
+    if images:
+        img_block += "\n\n---\n## 📷 页面图片描述\n"
+        for i, img in enumerate(images, 1):
+            img_block += f"\n**图片 {i}**: {img['description']}\n"
+            alt_text = img.get('alt', '')
+            img_block += f"  ![alt: {alt_text}]({img['url']}) <!-- original -->\n"
+
+    footer = f"\n\n---"
+    footer += f"\n📄 {url} | 文本: {text_source} | 代理: {fetch_source}"
+    if vision_info:
+        footer += f" | 图片: {vision_info}"
+
+    overhead = len(img_block) + len(footer) + 300
+    budget = max_chars - overhead
+    compress_tag = ""
+
+    if len(text) <= max_chars:
+        # Fits — no compression needed
+        output = text.rstrip()
+    else:
+        output = text
+        # Stage 1: Extractive compression (keep high-signal paragraphs)
+        if len(output) + overhead > max_chars and budget > 200:
+            output = extractive_compress(output, budget)
+            compress_tag = "extractive"
+            if output and len(output) + overhead <= max_chars:
+                log(f"   Extractive: {len(text)} → {len(output)} chars (fits)")
+
+        # Stage 2: Abstractive compression (LLM with code protection)
+        if use_summary and len(output) + overhead > max_chars and budget > 200:
+            log(f"   Abstractive: {len(output)} → target ~{budget} chars")
+            compressed = abstractive_compress(output, url, budget)
+            if compressed and quality_gate(output, compressed):
+                output = compressed
+                compress_tag = "abstractive"
+                log(f"   Quality gate: PASS ({len(compressed)} chars)")
+            elif compressed:
+                log(f"   Quality gate: FAIL (signal loss detected) → keeping extractive")
+            else:
+                log(f"   Abstractive failed → keeping extractive")
+
+        # Stage 3: Final truncation if still too large
+        if len(output) + overhead > max_chars:
+            budget = max_chars - overhead - 100
+            if budget < 200:
+                output = output[:max_chars - len(footer) - 50]
+                img_block = ""
+            else:
+                output = output[:budget]
+            output += f"\n\n---\n⚠️ 内容已截断 ({len(text)} → {len(output)} 字符)。"
+
+    # Build final
+    result = output + img_block + footer
+
+    if compress_tag:
+        # Replace source tag with compression info
+        result = result.replace(
+            f"| 文本: {text_source} |",
+            f"| 文本: {text_source} ({compress_tag}) |"
+        )
+
+    return result
+
+
+# ── Main ──────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Full web page extraction (text + vision)")
+    parser.add_argument("url", help="URL to extract")
+    parser.add_argument("--mode", choices=["quick", "normal", "deep"], default="normal",
+                        help="Output mode: quick (800 chars), normal (4K, default), deep (12K)")
+    parser.add_argument("--format", choices=["md", "text"], default="md")
+    parser.add_argument("--max-chars", type=int, default=None,
+                        help="Override max chars (default depends on --mode)")
+    parser.add_argument("--max-images", type=int, default=DEFAULT_MAX_IMAGES)
+    parser.add_argument("--no-vision", action="store_true",
+                        help="Skip image description (fast text-only path)")
+    parser.add_argument("--vision", action="store_true",
+                        help="Force image description even for text-only pages")
+    parser.add_argument("--raw-html", action="store_true",
+                        help="Output raw fetched HTML")
+    parser.add_argument("--raw", action="store_true",
+                        help="Output JSON (text + structured image data)")
+    parser.add_argument("--no-text", action="store_true",
+                        help="Only output image descriptions")
+    parser.add_argument("--crawler", choices=["jina", "raw"], default="jina",
+                        help="Fetch backend: jina (clean Markdown) or raw (HTML-based, default: jina)")
+    parser.add_argument("--summarize", action="store_true",
+                        help="Force LLM compression (auto-enabled in quick/normal modes)")
+    parser.add_argument("--no-summarize", action="store_true",
+                        help="Disable LLM compression (force truncation)")
+    args = parser.parse_args()
+
+    # Resolve mode → defaults
+    preset = MODE_PRESETS.get(args.mode, MODE_PRESETS["normal"])
+    if args.max_chars is None:
+        args.max_chars = preset["max_chars"]
+    use_summary = preset["summarize"]
+    if args.summarize:
+        use_summary = True
+    if args.no_summarize:
+        use_summary = False
+    args._use_summary = use_summary
+
+    t0 = time.time()
+
+    # 1. Fetch
+    use_jina = args.crawler == "jina"
+    log(f"📡 Fetching: {args.url}" + (" (Jina)" if use_jina else ""))
+    content, fetch_source = fetch_html(args.url, prefer_jina=use_jina)
+    if not content:
+        print(f"❌ Failed to fetch: {args.url}", file=sys.stderr)
+        print("👉 Try WebFetch as fallback", file=sys.stderr)
+        sys.exit(1)
+    log(f"   Content: {len(content)} bytes from {fetch_source} ({time.time() - t0:.1f}s)")
+
+    if args.raw_html:
+        print(content)
+        sys.exit(0)
+
+    # 2. Extract text
+    text = ""
+    text_source = "none"
+    if not args.no_text:
+        t1 = time.time()
+        text, text_source = extract_text(content, args.format, fetch_source)
+        log(f"   Text: {len(text)} chars via {text_source} ({time.time() - t1:.1f}s)")
+
+    # 3. Find + describe images (only for raw HTML; Jina Markdown has no <img> tags)
+    images = []
+    vision_info = ""
+    if not args.no_vision and fetch_source != "jina":
+        t2 = time.time()
+        candidates = find_images(content, args.url)
+        log(f"   Found {len(candidates)} candidate images")
+
+        if candidates:
+            downloaded = download_images(candidates, args.max_images)
+            log(f"   Downloaded {len(downloaded)}/{len(candidates)}")
+
+            if downloaded:
+                t3 = time.time()
+                descs = describe_images(downloaded, text[:2000] if text else "")
+                images = descs
+                vision_info = f"{VISION_MODEL} ({time.time() - t3:.1f}s, {len(descs)}/{len(downloaded)} described)"
+                log(f"   Vision: {vision_info}")
+            elif args.vision:
+                log("   (no downloadable images found)")
+        elif args.vision:
+            log("   (no candidate images found)")
+
+    # 4. Format output
+    output = format_output(text, images, args.url,
+                           text_source, fetch_source, vision_info,
+                           args.max_chars, args.raw, args._use_summary, args.mode)
+    print(output)
+
+    log(f"✅ Done ({time.time() - t0:.1f}s total)")
+
+
+if __name__ == "__main__":
+    main()

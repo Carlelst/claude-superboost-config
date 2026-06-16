@@ -1,0 +1,95 @@
+#!/bin/bash
+# web-version — Version management for web-search tools
+# Usage:
+#   web-version                     Show current version and hashes
+#   web-version check               Integrity check (verify hashes)
+#   web-version backup [tag]        Create backup archive
+#   web-version restore <tag>       Restore from backup
+#   web-version list                List all backups
+
+set -euo pipefail
+
+TOOLS_DIR="$(dirname "$0")"
+VERSION_FILE="$TOOLS_DIR/.web-tools-version"
+BACKUP_DIR="$TOOLS_DIR/.web-backups"
+
+# ── Commands ─────────────────────────────────────────
+cmd_version() {
+    if [ -f "$VERSION_FILE" ]; then
+        echo "web-tools v$(grep '^VERSION=' "$VERSION_FILE" | cut -d= -f2) ($(grep '^DATE=' "$VERSION_FILE" | cut -d= -f2))"
+    else
+        echo "web-tools (unversioned)"
+    fi
+    echo ""
+    echo "Components:"
+    echo "  web               $(stat -c%s "$TOOLS_DIR/web" 2>/dev/null || echo '?') bytes"
+    echo "  web-extract       $(stat -c%s "$TOOLS_DIR/web-extract" 2>/dev/null || echo '?') bytes"
+    echo "  web-synthesize    $(stat -c%s "$TOOLS_DIR/web-synthesize" 2>/dev/null || echo '?') bytes"
+}
+
+cmd_check() {
+    if [ ! -f "$VERSION_FILE" ]; then
+        echo "⚠️  No version file found"
+        exit 1
+    fi
+    local ok=true
+    for f in web web-extract web-synthesize; do
+        local expected
+        expected=$(grep "^sha_${f/-/_}=" "$VERSION_FILE" | cut -d= -f2)
+        local actual
+        actual=$(sha256sum "$TOOLS_DIR/$f" 2>/dev/null | cut -d' ' -f1)
+        if [ "$expected" = "$actual" ]; then
+            echo "  ✅ $f"
+        else
+            echo "  ❌ $f (expected: ${expected:0:8}..., got: ${actual:0:8}...)"
+            ok=false
+        fi
+    done
+    $ok && echo "All files intact." || { echo "⚠️  Integrity check FAILED"; exit 1; }
+}
+
+cmd_backup() {
+    local tag="${1:-v$(grep '^VERSION=' "$VERSION_FILE" | cut -d= -f2)}"
+    mkdir -p "$BACKUP_DIR"
+    local path="$BACKUP_DIR/web-tools-${tag}-backup.tar.gz"
+    tar -czf "$path" -C "$TOOLS_DIR" web web-extract web-synthesize .web-tools-version 2>/dev/null
+    echo "✅ Backup: $path ($(stat -c%s "$path" 2>/dev/null || echo '?') bytes)"
+}
+
+cmd_restore() {
+    local tag="$1"
+    local path="$BACKUP_DIR/web-tools-${tag}-backup.tar.gz"
+    if [ ! -f "$path" ]; then
+        echo "❌ Backup not found: $path"
+        echo "Available backups:"
+        cmd_list
+        exit 1
+    fi
+    # Create safety backup first
+    local safety="$BACKUP_DIR/web-tools-pre-${tag}-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+    tar -czf "$safety" -C "$TOOLS_DIR" web web-extract web-synthesize .web-tools-version 2>/dev/null
+    echo "📦 Safety backup: $safety"
+
+    tar -xzf "$path" -C "$TOOLS_DIR"
+    chmod +x "$TOOLS_DIR"/web "$TOOLS_DIR"/web-extract "$TOOLS_DIR"/web-synthesize 2>/dev/null || true
+    echo "✅ Restored to $tag"
+}
+
+cmd_list() {
+    if [ -d "$BACKUP_DIR" ]; then
+        ls -lh "$BACKUP_DIR"/*.tar.gz 2>/dev/null || echo "(no backups)"
+    else
+        echo "(no backups)"
+    fi
+}
+
+# ── Dispatch ─────────────────────────────────────────
+CMD="${1:-version}"; shift || true
+case "$CMD" in
+    version|"")  cmd_version ;;
+    check)       cmd_check ;;
+    backup)      cmd_backup "$@" ;;
+    restore)     cmd_restore "$@" ;;
+    list)        cmd_list ;;
+    *)           echo "Usage: web-version {version|check|backup [tag]|restore <tag>|list}" ;;
+esac
