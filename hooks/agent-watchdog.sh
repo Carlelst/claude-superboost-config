@@ -26,10 +26,33 @@ RATE_WINDOW=10             # seconds for rate calculation
 MAX_AGENTS_HARD="${RESOURCE_MAX_AGENTS_HARD:-$(( RESOURCE_MAX_AGENT_CAP:-30 ))}"  # absolute cap to kill above
 
 cmd_start() {
-  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo "watchdog already running (pid $(cat "$PIDFILE"))"
-    exit 1
+  # --- Clean up orphan watchdogs before starting ---
+  # Kill any watchdog processes whose parent is init (orphaned)
+  # or watchdog processes running but not matching the current PID file
+  local self_pid=$$
+  local current_pid=""
+  [ -f "$PIDFILE" ] && current_pid=$(cat "$PIDFILE" 2>/dev/null)
+
+  pgrep -f "agent-watchdog.sh start" 2>/dev/null | while read -r orphan_pid; do
+    [ "$orphan_pid" = "$self_pid" ] && continue
+    [ "$orphan_pid" = "$current_pid" ] && continue
+    local ppid=$(ps -o ppid= -p "$orphan_pid" 2>/dev/null | tr -d ' ')
+    # Kill if orphan (parent is init) or parent process no longer exists
+    if [ "$ppid" = "1" ] || ! kill -0 "$ppid" 2>/dev/null; then
+      echo "Cleaning up orphan watchdog pid=$orphan_pid" >> "$LOGFILE"
+      kill "$orphan_pid" 2>/dev/null
+    fi
+  done
+  sleep 0.3
+
+  # --- Dedup: if PID file points to alive watchdog, reuse it ---
+  if [ -n "$current_pid" ] && kill -0 "$current_pid" 2>/dev/null; then
+    echo "watchdog already running (pid $current_pid)"
+    exit 0
   fi
+
+  # Clean stale PID file
+  rm -f "$PIDFILE"
 
   echo "Starting agent watchdog (hard_floor=${HARD_FLOOR_MB}MB, soft_floor=${SOFT_FLOOR_MB}MB, rate_threshold=${RATE_THRESHOLD_MB}MB/s)..."
 

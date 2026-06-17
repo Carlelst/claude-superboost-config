@@ -1,7 +1,6 @@
 {
   "env": {
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
-    "DISABLE_COMPACT": "1",
     "RESOURCE_HARD_FLOOR_MB": "2048",
     "RESOURCE_MAX_AGENTS_HARD": "12",
     "RESOURCE_MAX_AGENT_CAP": "15",
@@ -32,7 +31,7 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "*",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
