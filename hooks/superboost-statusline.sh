@@ -10,13 +10,20 @@ DURATION=$(echo "$INPUT" | jq -r '.duration.total_seconds // 0' 2>/dev/null)
 
 # ---- Model → context window size fallback ----
 if [ "$CTX_SIZE" -le 0 ] 2>/dev/null; then
-  case "$MODEL" in
-    *Opus*)   CTX_SIZE=200000 ;;
-    *Sonnet*) CTX_SIZE=200000 ;;
-    *Haiku*)  CTX_SIZE=200000 ;;
-    *deepseek*) CTX_SIZE=128000 ;;
-    *)        CTX_SIZE=200000 ;;
-  esac
+  CACHE_FILE="/tmp/anthropic-proxy-active-model.txt"
+  if [ -f "$CACHE_FILE" ] && [ "$(find "$CACHE_FILE" -mmin -5 2>/dev/null)" ]; then
+    CTX_SIZE=$(cut -d: -f2 "$CACHE_FILE" 2>/dev/null)
+  fi
+  if [ "$CTX_SIZE" -le 0 ] 2>/dev/null; then
+    case "$MODEL" in
+      *v4*|*V4*)      CTX_SIZE=1048576 ;;  
+      *deepseek*)      CTX_SIZE=128000 ;;
+      *Opus*)          CTX_SIZE=200000 ;;
+      *Sonnet*)        CTX_SIZE=200000 ;;
+      *Haiku*)         CTX_SIZE=200000 ;;
+      *)               CTX_SIZE=200000 ;;
+    esac
+  fi
 fi
 
 # ---- System RAM ----

@@ -23,127 +23,41 @@ HARD_FLOOR_MB="${RESOURCE_HARD_FLOOR_MB:-2048}"      # 2GB absolute floor — ki
 SOFT_FLOOR_MB="${RESOURCE_SOFT_FLOOR_MB:-4096}"      # 4GB — kill newest agent
 RATE_THRESHOLD_MB="${RESOURCE_RATE_THRESHOLD_MB:-500}" # MB/s drain rate to trigger preemptive kill
 RATE_WINDOW=10             # seconds for rate calculation
-MAX_AGENTS_HARD="${RESOURCE_MAX_AGENTS_HARD:-$(( RESOURCE_MAX_AGENT_CAP:-30 ))}"  # absolute cap to kill above
+MAX_AGENTS_HARD="${RESOURCE_MAX_AGENTS_HARD:-$(( ${RESOURCE_MAX_AGENT_CAP:-30} ))}"  # absolute cap to kill above
+
+LOCKFILE="$HOME/.claude/.agent-watchdog.lock"
 
 cmd_start() {
-  # --- Clean up orphan watchdogs before starting ---
-  # Kill any watchdog processes whose parent is init (orphaned)
-  # or watchdog processes running but not matching the current PID file
+  # --- Mutual exclusion via flock ---
+  exec 200>"$LOCKFILE"
+  flock -n 200 || { echo "Another watchdog start in progress, skipping" >&2; exit 0; }
+
   local self_pid=$$
   local current_pid=""
-  [ -f "$PIDFILE" ] && current_pid=$(cat "$PIDFILE" 2>/dev/null)
 
-  pgrep -f "agent-watchdog.sh start" 2>/dev/null | while read -r orphan_pid; do
-    [ "$orphan_pid" = "$self_pid" ] && continue
-    [ "$orphan_pid" = "$current_pid" ] && continue
-    local ppid=$(ps -o ppid= -p "$orphan_pid" 2>/dev/null | tr -d ' ')
-    # Kill if orphan (parent is init) or parent process no longer exists
-    if [ "$ppid" = "1" ] || ! kill -0 "$ppid" 2>/dev/null; then
-      echo "Cleaning up orphan watchdog pid=$orphan_pid" >> "$LOGFILE"
-      kill "$orphan_pid" 2>/dev/null
+  # --- Check if watchdog is already running via PID file ---
+  if [ -f "$PIDFILE" ]; then
+    current_pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$current_pid" ] && kill -0 "$current_pid" 2>/dev/null; then
+      echo "watchdog already running (pid $current_pid)"
+      exit 0
     fi
-  done
-  sleep 0.3
-
-  # --- Dedup: if PID file points to alive watchdog, reuse it ---
-  if [ -n "$current_pid" ] && kill -0 "$current_pid" 2>/dev/null; then
-    echo "watchdog already running (pid $current_pid)"
-    exit 0
+    # PID file is stale
+    rm -f "$PIDFILE"
   fi
-
-  # Clean stale PID file
-  rm -f "$PIDFILE"
 
   echo "Starting agent watchdog (hard_floor=${HARD_FLOOR_MB}MB, soft_floor=${SOFT_FLOOR_MB}MB, rate_threshold=${RATE_THRESHOLD_MB}MB/s)..."
 
-  # Background daemon
-  (
-    echo $$ > "$PIDFILE"
+  # Background daemon (starting external script with nohup for full detachment)
+  local daemon_script="$HOOKS_DIR/.agent-watchdog-daemon.sh"
+  nohup bash "$daemon_script" \
+    "$PIDFILE" "$LOGFILE" "$CHECK_INTERVAL" \
+    "$HARD_FLOOR_MB" "$SOFT_FLOOR_MB" "$RATE_THRESHOLD_MB" "$RATE_WINDOW" \
+    "$MAX_AGENTS_HARD" \
+    > /dev/null 2>&1 &
+  DAEMON_PID=$!
 
-    # Track memory samples for rate detection
-    SAMPLES=()
-
-    while true; do
-      get_meminfo 2>/dev/null
-
-      if [ "$AVAIL_MB" -eq 0 ]; then
-        sleep "$CHECK_INTERVAL"
-        continue
-      fi
-
-      TIMESTAMP=$(date -u +%H:%M:%S)
-      CLAUDE_COUNT=$(ps -eo comm,pid,etimes 2>/dev/null | awk -v now="$(date +%s)" '
-        /^claude / {
-          pid=$2
-          etime=$3
-          # get RSS in KB
-          cmd="ps -o rss= -p " pid " 2>/dev/null"
-          cmd | getline rss
-          close(cmd)
-          rss=int(rss/1024)
-          printf "%d|%d|%d\n", pid, etime, rss
-        }
-      ')
-
-      # --- Rate detection: memory drain speed ---
-      if [ ${#SAMPLES[@]} -ge $((RATE_WINDOW / CHECK_INTERVAL)) ]; then
-        SAMPLES=("${SAMPLES[@]:1}")
-      fi
-      SAMPLES+=("$AVAIL_MB")
-
-      DRAIN_RATE=0
-      if [ ${#SAMPLES[@]} -ge $((RATE_WINDOW / CHECK_INTERVAL)) ]; then
-        OLDEST=${SAMPLES[0]}
-        DRAIN_RATE=$(( (OLDEST - AVAIL_MB) / (${#SAMPLES[@]} * CHECK_INTERVAL) ))
-      fi
-
-      # --- Hard floor: kill newest claude processes ---
-      if [ "$AVAIL_MB" -lt "$HARD_FLOOR_MB" ]; then
-        NEWEST=$(echo "$CLAUDE_COUNT" | sort -t'|' -k2 -n | head -1)
-        KILL_PID=$(echo "$NEWEST" | cut -d'|' -f1)
-        KILL_RSS=$(echo "$NEWEST" | cut -d'|' -f3)
-        echo "[$TIMESTAMP] 🚨 HARD FLOOR ${AVAIL_MB}MB < ${HARD_FLOOR_MB}MB — killing newest agent pid=$KILL_PID rss=${KILL_RSS}MB" >> "$LOGFILE"
-        kill "$KILL_PID" 2>/dev/null
-        sleep 1
-        continue
-      fi
-
-      # --- Soft floor + high rate: preemptive kill ---
-      if [ "$AVAIL_MB" -lt "$SOFT_FLOOR_MB" ] && [ "$DRAIN_RATE" -gt "$RATE_THRESHOLD_MB" ]; then
-        # Find the largest newer agent (shortest running = most likely culprit)
-        NEWEST=$(echo "$CLAUDE_COUNT" | sort -t'|' -k2 -n | head -1)
-        KILL_PID=$(echo "$NEWEST" | cut -d'|' -f1)
-        KILL_AGE=$(echo "$NEWEST" | cut -d'|' -f2)
-        KILL_RSS=$(echo "$NEWEST" | cut -d'|' -f3)
-        echo "[$TIMESTAMP] ⚠️ SOFT FLOOR + HIGH DRAIN ${DRAIN_RATE}MB/s — killing pid=$KILL_PID age=${KILL_AGE}s rss=${KILL_RSS}MB" >> "$LOGFILE"
-        kill "$KILL_PID" 2>/dev/null
-        sleep 1
-        continue
-      fi
-
-      # --- Agent count hard cap ---
-      AGENT_COUNT=$(echo "$CLAUDE_COUNT" | wc -l)
-      if [ "$AGENT_COUNT" -gt "$MAX_AGENTS_HARD" ]; then
-        OVER=$(( AGENT_COUNT - MAX_AGENTS_HARD ))
-        # Kill newest N agents
-        echo "$CLAUDE_COUNT" | sort -t'|' -k2 -n | head -"$OVER" | while IFS='|' read pid age rss; do
-          echo "[$TIMESTAMP] 📊 AGENT CAP ${AGENT_COUNT} > ${MAX_AGENTS_HARD} — killing pid=$pid age=${age}s rss=${rss}MB" >> "$LOGFILE"
-          kill "$pid" 2>/dev/null
-        done
-        sleep 1
-        continue
-      fi
-
-      # --- Log trends (every 10th check) ---
-      if [ $((RANDOM % 10)) -eq 0 ]; then
-        echo "[$TIMESTAMP] avail=${AVAIL_MB}MB agents=${AGENT_COUNT} drain_rate=${DRAIN_RATE}MB/s" >> "$LOGFILE"
-      fi
-
-      sleep "$CHECK_INTERVAL"
-    done
-  ) &
-
-  echo "watchdog started (pid $!)"
+  echo "watchdog started (pid $DAEMON_PID)"
 }
 
 cmd_stop() {

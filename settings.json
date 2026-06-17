@@ -27,7 +27,7 @@
     ],
     "defaultMode": "bypassPermissions"
   },
-  "model": "opus",
+  "model": "sonnet",
   "hooks": {
     "PostToolUse": [
       {
