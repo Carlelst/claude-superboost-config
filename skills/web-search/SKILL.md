@@ -49,6 +49,7 @@ web-version list         # 列出所有备份
 | 输入类型 | 命令 |
 |----------|------|
 | `github.com/*` URL | `web fetch <url>` → gh CLI |
+| `mp.weixin.qq.com/*` URL | `web fetch <url>` → playwright-stealth 自动路由 |
 | 普通 `https?://*` URL | `web fetch <url>` → web-extract 完整提取 |
 | 网页完整内容提取 | `web extract <url>` / `web full <url>` |
 | 多模态提取（含图片理解） | `web vision <url>` / `web extract-images <url>` |
@@ -135,6 +136,17 @@ web 脚本退出码:
 
 **绝不跳过 web 脚本直接调 WebSearch/WebFetch。**
 
+## 微信文章抓取
+
+`mp.weixin.qq.com` 域名由腾讯 TCaptcha 防护，常规 HTTP 请求（curl/WebFetch/Jina/SearXNG 代理）均被拦截，返回"环境异常"验证页面。
+
+`web-extract` 检测到 `mp.weixin.qq.com` / `mp.weixinbridge.com` 域名时，**自动路由到 playwright-stealth**（Python 真实 Chromium + 反检测脚本），绕过 TCaptcha 抓取文章全文。
+
+**依赖：** `pip3 install playwright playwright-stealth`
+**脚本：** `~/.claude/scripts/fetch_wx.py`
+**用法：** `web fetch <mp.weixin.qq.com url>` / `web extract <mp.weixin.qq.com url>`
+**输出：** `/tmp/wx_article/article.txt`（纯文本）+ `article.json`（结构化）
+
 ## 常用命令
 
 ```bash
@@ -203,6 +215,7 @@ web probe                                    # 完整健康检查
 
 ```
 URL 获取
+  ├─ mp.weixin.qq.com → playwright-stealth (绕过 TCaptcha)
   ├─ GitHub URL → gh CLI（结构化 API）
   └─ 普通 URL → SearXNG 代理 / 直接 curl
        ↓

@@ -30,12 +30,25 @@ fi
 TOTAL_MB=$(awk '/MemTotal/    {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
 AVAIL_MB=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "$TOTAL_MB")
 
-# ---- Claude process RSS ----
-if [ "$(uname)" = "Darwin" ]; then
-  CLAUDE_MB=$(ps -eo rss,comm 2>/dev/null | awk '/[Cc]laude$/ && !/awk/ {s+=$1} END {printf "%.0f", s/1024}')
-else
-  CLAUDE_MB=$(ps -eo rss,comm --no-headers 2>/dev/null | awk '/[Cc]laude$/ {s+=$1} END {printf "%.0f", s/1024}')
-fi
+# ---- Claude process RSS (this session only) ----
+# The statusline script is spawned by the claude process, so PPID gives us the
+# claude node process. We walk up to find the ancestor named "claude" (not "node").
+get_my_claude_rss() {
+  local pid=$PPID
+  local comm=""
+  # Walk up at most 5 levels to find the claude process
+  for i in 1 2 3 4 5; do
+    comm=$(cat /proc/$pid/comm 2>/dev/null || true)
+    if [ "$comm" = "claude" ]; then
+      awk '/^VmRSS:/ {printf "%.0f", $2/1024}' /proc/$pid/status 2>/dev/null
+      return
+    fi
+    pid=$(awk '/^PPid:/ {print $2}' /proc/$pid/status 2>/dev/null || true)
+    [ -z "$pid" ] || [ "$pid" -le 1 ] && break
+  done
+  echo "0"
+}
+CLAUDE_MB=$(get_my_claude_rss)
 CLAUDE_MB="${CLAUDE_MB:-0}"
 
 # ---- Token/context numbers ----
@@ -122,4 +135,4 @@ fi
 RAM_BAR=$(bar "$SYS_USED_PCT" "$RAM_C")
 CTX_BAR=$(bar "$CTX_PCT" "$CTX_C")
 
-printf '%b' "${MODEL} │ RAM:${RAM_BAR} ${SYS_USED_G}G/${TOTAL_G}G │ ctx:${CTX_BAR} ${CTX_USED_HR}/${CTX_TOTAL_HR}│ agents:${AGENT_COUNT}/${MAX_AGENTS}${TIME_STR}"
+printf '%b' "${MODEL} │ RAM:${RAM_BAR} ${SYS_USED_G}G/${TOTAL_G}G (me:${CLAUDE_G}G) │ ctx:${CTX_BAR} ${CTX_USED_HR}/${CTX_TOTAL_HR}│ agents:${AGENT_COUNT}/${MAX_AGENTS}${TIME_STR}"

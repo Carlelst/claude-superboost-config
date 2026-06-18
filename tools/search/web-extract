@@ -14,6 +14,7 @@
 #   web-extract <url> --crawler jina      Use Jina AI Reader (URL → clean Markdown)
 #
 # Pipeline:
+#   0. Domain route: mp.weixin.qq.com → playwright-stealth (bypass TCaptcha)
 #   1. Fetch (4-tier: Jina AI Reader → SearXNG proxy → direct curl → raw)
 #   2. Extract text (trafilatura → readability → html2text → raw)
 #   3. Find meaningful images in HTML
@@ -25,6 +26,7 @@
 #   trafilatura, readability-lxml, pandoc, html2text
 #   Kimi k2.6 at LLM_PROXY (default http://172.16.90.45:8082)
 #   Jina AI Reader: free, no API key, JS-rendered page support
+#   playwright-stealth: for WeChat MP articles (pip install playwright playwright-stealth)
 # ============================================================
 
 import sys, os, re, json, base64, time, argparse, subprocess, shutil
@@ -618,6 +620,92 @@ def format_output(text: str, images: list[dict], url: str,
     return result
 
 
+# ── WeChat MP article fetch ──────────────────────────────────
+
+WX_FETCH_SCRIPT = os.path.expanduser("~/.claude/scripts/fetch_wx.py")
+
+WX_DOMAINS = [
+    "mp.weixin.qq.com",
+    "mp.weixinbridge.com",
+]
+
+
+def _url_matches_domain(url: str, domains: list[str]) -> bool:
+    """Check if URL matches any of the given domains."""
+    try:
+        host = urlparse(url).hostname or ""
+        return any(host == d or host.endswith("." + d) for d in domains)
+    except Exception:
+        return False
+
+
+def fetch_wx_article(url: str) -> tuple[str, str, str]:
+    """Fetch WeChat MP article via playwright-stealth.
+    Returns (text, title, source_info).
+    Raises RuntimeError if wx script is missing or fails.
+    """
+    if not os.path.isfile(WX_FETCH_SCRIPT):
+        raise RuntimeError(
+            f"WeChat fetch script not found: {WX_FETCH_SCRIPT}\n"
+            f"Install: pip3 install playwright playwright-stealth"
+        )
+
+    # Resolve wx article from /tmp/wx_article/
+    import tempfile
+    from pathlib import Path
+
+    out_dir = Path(tempfile.gettempdir()) / "wx_article"
+
+    try:
+        result = subprocess.run(
+            [sys.executable, WX_FETCH_SCRIPT, url],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        stderr_out = result.stderr.strip()
+        stdout_out = result.stdout.strip()
+
+        # Prefer stderr (playwright logs go there), fallback to stdout
+        combined = stderr_out + "\n" + stdout_out
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("WeChat fetch timed out (120s)")
+    except FileNotFoundError:
+        raise RuntimeError(f"Python not found — cannot run wx fetch script")
+
+    # Read output files
+    txt_path = out_dir / "article.txt"
+    json_path = out_dir / "article.json"
+
+    if not txt_path.exists():
+        raise RuntimeError(
+            f"WeChat fetch failed — no output produced.\n"
+            f"Stderr: {combined[:500]}"
+        )
+
+    text = txt_path.read_text(encoding="utf-8")
+
+    # Try to read title from JSON
+    title = ""
+    if json_path.exists():
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+            title = data.get("title", "")
+        except Exception:
+            pass
+
+    if not title:
+        # Extract title from text first line
+        first_line = text.split("\n")[0].strip() if text else ""
+        title = first_line if first_line else "微信文章"
+
+    source_info = "wechat-playwright"
+    return text, title, source_info
+
+
+def _is_wx_domain(url: str) -> bool:
+    return _url_matches_domain(url, WX_DOMAINS)
+
+
 # ── Main ──────────────────────────────────────────────────
 
 def main():
@@ -646,6 +734,25 @@ def main():
     parser.add_argument("--no-summarize", action="store_true",
                         help="Disable LLM compression (force truncation)")
     args = parser.parse_args()
+
+    # ── WeChat domain route ─────────────────────────────────
+    if _is_wx_domain(args.url):
+        try:
+            text, title, source = fetch_wx_article(args.url)
+        except RuntimeError as e:
+            print(f"❌ WeChat fetch failed: {e}", file=sys.stderr)
+            print("👉 Try opening the article in browser and paste the content", file=sys.stderr)
+            sys.exit(1)
+
+        # Output in standard format
+        print(f"# {title}")
+        print()
+        print(text)
+        print()
+        print("---")
+        print(f"📄 {args.url} | 来源: {source} (playwright-stealth)")
+        log(f"✅ WeChat article fetched ({len(text)} chars, {time.time() - __import__('time').time():.1f}s)")
+        sys.exit(0)
 
     # Resolve mode → defaults
     preset = MODE_PRESETS.get(args.mode, MODE_PRESETS["normal"])

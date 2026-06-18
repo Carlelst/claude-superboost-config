@@ -4,6 +4,7 @@
 # Usage: source ~/.claude/hooks/meminfo-lib.sh; get_meminfo
 
 get_meminfo() {
+  LOGFILE_DEFAULT="$HOME/.claude/logs/ram-monitor.log"
   if [ "$(uname)" = "Darwin" ]; then
     PAGE_SIZE=$(sysctl -n hw.pagesize 2>/dev/null || echo 16384)
     VM=$(vm_stat 2>/dev/null)
@@ -14,10 +15,12 @@ get_meminfo() {
     AVAIL_MB=$(( (FREE_P + INACT_P + PURG_P + SPEC_P) * PAGE_SIZE / 1024 / 1024 ))
     TOTAL_MB=$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))
     LOAD_AVG=$(uptime 2>/dev/null | awk -F'load averages:' '{print $2}' | awk '{gsub(/,/,""); print $1}')
+    LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
   else
     AVAIL_MB=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
     TOTAL_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
     LOAD_AVG=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+    LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
   fi
   AVAIL_GB=$(awk "BEGIN {printf \"%.1f\", $AVAIL_MB / 1024}")
   TOTAL_GB=$(awk "BEGIN {printf \"%.0f\", $TOTAL_MB / 1024}")
