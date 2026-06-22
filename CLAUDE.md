@@ -99,62 +99,17 @@ BGE-Reranker 自动重排序，SearXNG → gh CLI → WebSearch 三级降级。
 
 触发: 新写(>30行) / 重构 / 审查 / 调试 / 安全 / 性能 / API设计 / 测试 / 部署
 
-完整 130 关键词索引 → **agent-dispatch** Skill。高频速查:
+完整 130 关键词索引、MCP 工具路由表 → 对应 skill 按需加载，此处省略。
 
-Python→`python-pro` TS/JS→`typescript-pro`/`javascript-pro` Rust→`rust-engineer` Go→`golang-pro`
-审查→`code-reviewer` 调试→`debugger` 安全→`security-auditor` 性能→`performance-engineer`
-测试→`test-automator` API→`api-designer` DB→`sql-pro` Docker→`docker-expert` K8s→`kubernetes-specialist`
-CI/CD→`devops-engineer` 重构→`refactoring-specialist` 文档→`documentation-engineer`
-前端→`frontend-developer` 后端→`backend-developer`
+## 工具使用
 
-### 派发协议
+**大输出处理**: 单次命令/读取返回 >100 行时，优先用 lean-ctx 的 ctx_shell/ctx_read/ctx_search（带压缩），避免直接用 bash 处理超大输出。
 
-1. 预检: 任务描述精确、上下文充足
-2. 进度: 多步骤任务要求输出进度
-3. 回传: agent 结果在主对话呈现
+**代码搜索**（避免与 lean-ctx 冲突）:
+- **结构化代码探索**（找函数/类/调用链/架构）→ 优先 `codebase-memory-mcp` 的 `search_graph` / `trace_path` / `get_code_snippet`（需先 `index_repository`）
+- **纯文本搜索**（grep 配置/日志/文档）→ 用 `ctx_search` 或 `Grep`
+- **读文件后编辑** → 始终先 `Read` 再 `Edit`
 
-@RTK.md
-
----
-
-## MCP 工具路由 (遇到对应场景优先用 MCP 工具)
-
-| 场景 | ❌ 不用 | ✅ 用 | MCP Server |
-|------|--------|------|------------|
-| 读文件 | `Read`/`cat` | `ctx_read` (10 种模式+缓存, 重读仅~13 tokens) | lean-ctx |
-| 搜索代码 | `Grep`/`rg` | `ctx_search` / `ffgrep` | lean-ctx / fff |
-| 目录浏览 | `ls`/`find` | `ctx_tree` | lean-ctx |
-| 执行命令 | 直接 `bash` | `ctx_shell` (95+ 压缩模式) | lean-ctx |
-| 文件编辑 | `Edit`/`StrReplace` | 照常用。如 Read 不可用则 `ctx_edit` | lean-ctx |
-| 文件精确搜索 | `find`/`fd` | `fffind` (frecency+git标注) | fff |
-| 多文件搜索 | 多次 `rg` | `fff-multi-grep` | fff |
-| 长内容压缩 | — | `headroom_compress` (60-95%) | headroom |
-| 压缩内容还原 | — | `headroom_retrieve` | headroom |
-| 压缩统计 | — | `headroom_stats` | headroom |
-| 任务管理 | TodoWrite/TaskCreate/md TODO | `bd create` / `bd ready` / `bd update --claim` | beads (CLI) |
-| 项目记忆 | MEMORY.md 文件 | `bd remember "xxx"` | beads (CLI) |
-| 跨 session 记忆 | — | claude-mem (自动) | claude-mem plugin |
-
-### 读取文件速查 (lean-ctx ctx_read modes)
-
-| 模式 | 用途 |
-|------|------|
-| `full` | 完整编辑 |
-| `map` | 文件结构概览 |
-| `signatures` | 函数/类签名 |
-| `diff` | 变更后验证 |
-| `lines:N-M` | 行范围 |
-| `density:X` | 按密度裁剪到 X% |
-| `auto` | 自动选择 |
-
-### 任务管理速查 (beads bd)
-
-```bash
-bd ready                          # 可领取的任务
-bd create "标题" -p 0 -t bug      # 创建任务
-bd update <id> --claim            # 原子领取
-bd show <id>                      # 查看详情
-bd close <id>                     # 完成任务
-bd remember "关键信息"             # 持久记忆
-bd prime                          # 注入完整工作流上下文
-```
+**联网搜索分工**:
+- 通用搜索/新闻/学术/ → `web-search` Skill（`web` 脚本）
+- 社交平台抓取（Twitter/Reddit/B站/小红书/YouTube）→ `agent-reach` Skill

@@ -1,6 +1,6 @@
 {
   "env": {
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000",
     "RESOURCE_HARD_FLOOR_MB": "2048",
     "RESOURCE_MAX_AGENTS_HARD": "12",
     "RESOURCE_MAX_AGENT_CAP": "15",
@@ -27,7 +27,7 @@
     ],
     "defaultMode": "bypassPermissions"
   },
-  "model": "sonnet",
+  "model": "opus",
   "hooks": {
     "PostToolUse": [
       {
@@ -80,6 +80,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-code-discovery-gate",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SessionStart": [
@@ -105,6 +115,15 @@
             "command": "bd prime"
           }
         ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [],
@@ -119,17 +138,17 @@
   },
   "enabledPlugins": {
     "andrej-karpathy-skills@karpathy-skills": true,
-    "bash-language-server@claude-code-lsps": true,
+    "bash-language-server@claude-code-lsps": false,
     "plugin-dev@claude-plugins-official": true,
-    "pyright-lsp@claude-plugins-official": true,
-    "voltagent-core-dev@voltagent-subagents": true,
+    "pyright-lsp@claude-plugins-official": false,
+    "voltagent-core-dev@voltagent-subagents": false,
     "voltagent-dev-exp@voltagent-subagents": false,
-    "voltagent-infra@voltagent-subagents": true,
+    "voltagent-infra@voltagent-subagents": false,
     "voltagent-lang@voltagent-subagents": true,
-    "voltagent-meta@voltagent-subagents": true,
+    "voltagent-meta@voltagent-subagents": false,
     "voltagent-qa-sec@voltagent-subagents": true,
     "vtsls@claude-code-lsps": true,
-    "yaml-language-server@claude-code-lsps": true,
+    "yaml-language-server@claude-code-lsps": false,
     "oh-my-claudecode@omc-local": true,
     "claude-mem@thedotmack": true
   },
@@ -165,7 +184,7 @@
       }
     }
   },
-  "effortLevel": "xhigh",
+  "effortLevel": "high",
   "autoUpdatesChannel": "latest",
   "skipDangerousModePermissionPrompt": true,
   "theme": "dark"

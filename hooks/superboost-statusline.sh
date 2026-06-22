@@ -3,6 +3,7 @@
 INPUT=$(cat)
 
 MODEL=$(echo "$INPUT" | jq -r '.model.display_name // "?"' 2>/dev/null)
+EFFORT=$(jq -r '.effortLevel // "?"' ~/.claude/settings.json 2>/dev/null)
 CTX_PCT_RAW=$(echo "$INPUT" | jq -r '.context_window.used_percentage // 0' 2>/dev/null)
 CTX_SIZE=$(echo "$INPUT" | jq -r '.context_window.context_window_size // 0' 2>/dev/null)
 CTX_PCT=$(awk "BEGIN {printf \"%.0f\", $CTX_PCT_RAW}")
@@ -135,4 +136,4 @@ fi
 RAM_BAR=$(bar "$SYS_USED_PCT" "$RAM_C")
 CTX_BAR=$(bar "$CTX_PCT" "$CTX_C")
 
-printf '%b' "${MODEL} │ RAM:${RAM_BAR} ${SYS_USED_G}G/${TOTAL_G}G (me:${CLAUDE_G}G) │ ctx:${CTX_BAR} ${CTX_USED_HR}/${CTX_TOTAL_HR}│ agents:${AGENT_COUNT}/${MAX_AGENTS}${TIME_STR}"
+printf '%b' "${MODEL} [${EFFORT}] │ RAM:${RAM_BAR} ${SYS_USED_G}G/${TOTAL_G}G (me:${CLAUDE_G}G) │ ctx:${CTX_BAR} ${CTX_USED_HR}/${CTX_TOTAL_HR}│ agents:${AGENT_COUNT}/${MAX_AGENTS}${TIME_STR}"
