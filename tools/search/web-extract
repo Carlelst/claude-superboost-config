@@ -40,6 +40,15 @@ LLM_PROXY = os.environ.get("LLM_PROXY", "http://172.16.90.45:8082")
 VISION_MODEL = os.environ.get("WEB_VISION_MODEL", "kimi-k2.6")
 SUMMARY_MODEL = os.environ.get("WEB_SUMMARY_MODEL", "deepseek-v4-pro")
 TIMEOUT = int(os.environ.get("WEB_TIMEOUT", "15"))
+# Global max wall-time guard: kill process group if exceeding WEB_EXTRACT_DEADLINE
+_WEB_EXTRACT_DEADLINE = int(os.environ.get("WEB_EXTRACT_DEADLINE", "60"))
+if _WEB_EXTRACT_DEADLINE > 0 and "_WEB_DEADLINE_SET" not in os.environ:
+    import signal
+    def _kill_group():
+        os.killpg(0, signal.SIGKILL)
+    signal.signal(signal.SIGALRM, lambda *_: _kill_group())
+    signal.alarm(_WEB_EXTRACT_DEADLINE)
+    os.environ["_WEB_DEADLINE_SET"] = "1"
 DEFAULT_MAX_CHARS = 4000  # normal mode default
 DEFAULT_MAX_IMAGES = 5
 IMAGE_MIN_BYTES = 200

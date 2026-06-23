@@ -32,6 +32,17 @@
 
 set -euo pipefail
 
+# Global timeout guard: kill the whole script after WEB_MAX_TIMEOUT seconds
+# Prevents runaway processes from blocking Claude Code for 20+ minutes
+WEB_MAX_TIMEOUT="${WEB_MAX_TIMEOUT:-60}"
+if [ -z "${_WEB_WATCHDOG:-}" ] && [ "${WEB_MAX_TIMEOUT}" -gt 0 ]; then
+    export _WEB_WATCHDOG=1
+    (
+        sleep "$WEB_MAX_TIMEOUT"
+        kill -KILL $$ 2>/dev/null || true
+    ) &
+fi
+
 # Global temp file registry for cleanup
 _WEB_TMPFILES=()
 _web_cleanup() {
@@ -43,7 +54,7 @@ trap _web_cleanup EXIT
 
 SEARX_BIN="${SEARX_BIN:-searx}"
 SEARX_HOST="${SEARXNG_URL:-http://192.168.20.21:8005}"
-SEARX_TIMEOUT="${SEARX_TIMEOUT:-15}"
+SEARX_TIMEOUT="${SEARX_TIMEOUT:-12}"
 MIN_RESULTS="${WEB_MIN_RESULTS:-3}"
 RERANK_URL="${RERANK_URL:-http://172.16.90.45:8082}"
 RERANK_MODEL="${RERANK_MODEL:-scs_bge-reranker}"
@@ -433,68 +444,23 @@ else:
         return 0
     fi
 
-    # Attempt 1: switch/add category
-    echo "🔄 重试 1/3: 切换类别..." >&2
-    local has_category=false
-    local retry1_args=()
-    skip_next=false
+    # Attempt 1: simplify to bare search (no category, no engine)
+    echo "🔄 重试: 简化搜索..." >&2
+    local retry_raw=("--count" "$fetch_count" "--raw")
+    # Carry forward --lang and --time if present
     for ((i=0; i<${#extra_args[@]}; i++)); do
-        if [ "$skip_next" = "true" ]; then skip_next=false; continue; fi
         case "${extra_args[$i]}" in
-            --it|--science|--packages|--repos|--qa|--videos|--images|--wiki|--books|--social|--weather|--map|--news)
-                has_category=true
-                continue ;;  # Remove existing category
-            --engine|--time|--count|--lang) skip_next=true; retry1_args+=("${extra_args[$i]}" "${extra_args[$((i+1))]}"); continue ;;
+            --lang|--time) retry_raw+=("${extra_args[$i]}" "${extra_args[$((i+1))]}"); i=$((i+1)) ;;
         esac
-        retry1_args+=("${extra_args[$i]}")
     done
-    # If no category was specified, add --it (most common for dev queries)
-    if [ "$has_category" = "false" ]; then
-        retry1_args+=("--it")
-    fi
-    local retry1_raw=()
-    skip_next=false
-    for ((i=0; i<${#retry1_args[@]}; i++)); do
-        if [ "$skip_next" = "true" ]; then skip_next=false; continue; fi
-        if [ "${retry1_args[$i]}" = "--count" ]; then skip_next=true; continue; fi
-        retry1_raw+=("${retry1_args[$i]}")
-    done
-    retry1_raw+=("--count" "$fetch_count" "--raw")
-    if do_one_search "${retry1_raw[@]}"; then
+    if do_one_search "${retry_raw[@]}"; then
         cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
         return 0
     fi
 
-    # Attempt 2: try specific engines (bing, baidu)
-    echo "🔄 重试 2/3: 切换引擎..." >&2
-    for eng in bing baidu; do
-        local retry2_raw=("${retry1_raw[@]}" "--engine" "$eng")
-        if do_one_search "${retry2_raw[@]}"; then
-            cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
-            return 0
-        fi
-    done
-
-    # Attempt 3: simplify query
-    echo "🔄 重试 3/3: 简化查询..." >&2
-    simple_query=$(echo "$query" | _WEB_QRY="$query" python3 -c "
-import sys, re, os
-q = os.environ['_WEB_QRY']
-q = re.sub(r'(怎么|如何|为什么|什么是|what is|how to|why|best|top|vs|versus|比较|对比|推荐)', '', q, flags=re.I)
-q = re.sub(r'\b(20\d{2})\b', '', q)
-q = re.sub(r'\s+', ' ', q).strip()
-print(q if len(q) > 2 else '')
-" 2>/dev/null)
-    if [ -n "$simple_query" ] && [ "$simple_query" != "$query" ]; then
-        if do_one_search "${retry1_raw[@]}"; then
-            cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
-            return 0
-        fi
-    fi
-
-    # All retries failed — output best available + warning
+    # All retries failed — fallback
     if [ -s "$tmp_reranked" ]; then
-        echo "⚠️  搜索质量偏低（3 次重试均未改善），以下为最佳可用结果" >&2
+        echo "⚠️  搜索质量偏低，以下为最佳可用结果" >&2
         cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
         return 1
     fi
@@ -530,25 +496,22 @@ do_search() {
         return 0
     fi
 
-    # Attempt 1: add --it if no category
-    local has_cat=false
+    # Attempt 1: bare search (strip category/engine)
+    echo "🔄 重试: 简化搜索..." >&2
+    local retry_args=()
+    local skip=false
     for a in "${extra_args[@]}"; do
-        case "$a" in --it|--science|--packages|--repos|--qa|--videos|--images|--wiki|--books|--social|--weather|--map|--news) has_cat=true ;; esac
+        if [ "$skip" = "true" ]; then skip=false; continue; fi
+        case "$a" in
+            --lang|--time) retry_args+=("$a"); skip=false ;;
+            --it|--science|--packages|--repos|--qa|--videos|--images|--wiki|--books|--social|--weather|--map|--news) ;;
+            --engine) skip=true ;;
+            *) retry_args+=("$a") ;;
+        esac
     done
-    if [ "$has_cat" = "false" ]; then
-        echo "🔄 重试: 加 --it 类别..." >&2
-        if try_text_search "${extra_args[@]}" "--it"; then
-            return 0
-        fi
+    if try_text_search "${retry_args[@]}"; then
+        return 0
     fi
-
-    # Attempt 2: try engines
-    echo "🔄 重试: 切换引擎..." >&2
-    for eng in bing baidu; do
-        if try_text_search "${extra_args[@]}" "--engine" "$eng"; then
-            return 0
-        fi
-    done
 
     echo "⚠️  SearXNG 搜索结果不足" >&2
     echo "👉 FALLBACK: Use built-in WebSearch tool instead" >&2
@@ -695,7 +658,7 @@ for i,r in enumerate(data.get('results',[])[:5],1):
     print()
 " 2>/dev/null
 
-            # Phase 2: fully extract each result
+            # Phase 2: fully extract each result (text-only for speed)
             if [ -n "$urls" ] && command -v web-extract &>/dev/null; then
                 echo "═══ 全文提取 ═══"
                 idx=1
@@ -703,7 +666,7 @@ for i,r in enumerate(data.get('results',[])[:5],1):
                     [ -z "$url" ] && continue
                     echo ""
                     echo "─── [$idx] ───"
-                    web-extract "$url" --max-chars 8000 2>/dev/null || echo "⚠️ 提取失败"
+                    web-extract "$url" --max-chars 8000 --no-vision 2>/dev/null || echo "⚠️ 提取失败"
                     idx=$((idx + 1))
                 done <<< "$urls"
             fi

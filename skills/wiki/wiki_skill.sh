@@ -232,18 +232,21 @@ cmd_search() {
 
 # --- page (by page-id or space+title) ---
 cmd_page() {
-    local page_id="${1:-}" space="${2:-}" title="${3:-}"
+    local page_id="${1:-}" space="${2:-}" title="${3:-}" raw_mode="${4:-}"
     local response
 
     if [ -n "$page_id" ]; then
         response=$(api_call GET "/rest/api/content/${page_id}" \
             -G --data-urlencode "expand=body.storage,version,ancestors") || return 1
 
-        echo "Page Info:"
-        print_separator
-        echo "$response" | jq -r \
-            --arg base "$WIKI_URL" \
-            '"
+        if [ "$raw_mode" = "1" ]; then
+            echo "$response" | jq -r '.body.storage.value'
+        else
+            echo "Page Info:"
+            print_separator
+            echo "$response" | jq -r \
+                --arg base "$WIKI_URL" \
+                '"
 Title    : \(.title)
 ID       : \(.id)
 Space    : \(.space.key)
@@ -252,6 +255,7 @@ URL      : \($base)pages/viewpage.action?pageId=\(.id)
 --
 Content:
 \(.body.storage.value)"'
+        fi
     elif [ -n "$space" ] && [ -n "$title" ]; then
         response=$(api_call GET "/rest/api/content" \
             -G \
@@ -266,9 +270,12 @@ Content:
             return 1
         fi
 
-        echo "$response" | jq -r \
-            --arg base "$WIKI_URL" \
-            '.results[0] | "
+        if [ "$raw_mode" = "1" ]; then
+            echo "$response" | jq -r '.results[0].body.storage.value'
+        else
+            echo "$response" | jq -r \
+                --arg base "$WIKI_URL" \
+                '.results[0] | "
 Title    : \(.title)
 ID       : \(.id)
 Space    : \(.space.key)
@@ -277,6 +284,7 @@ URL      : \($base)pages/viewpage.action?pageId=\(.id)
 --
 Content:
 \(.body.storage.value)"'
+        fi
     else
         echo "Error: Provide either --page-id or both --space and --title" >&2
         return 1
@@ -337,28 +345,44 @@ cmd_comments() {
 # --- create ---
 cmd_create() {
     local space="$1" title="$2" body="$3" parent_id="${4:-}"
-    local ancestors_json=""
     local response
 
-    if [ -n "$parent_id" ]; then
-        ancestors_json=", \"ancestors\": [{\"id\": \"$parent_id\"}]"
-    fi
-
     local payload
-    payload=$(cat <<EOF
-{
-    "type": "page",
-    "title": "$title",
-    "space": {"key": "$space"},
-    "body": {
-        "storage": {
-            "value": "$body",
-            "representation": "storage"
-        }
-    }${ancestors_json}
-}
-EOF
-)
+    if [ -n "$parent_id" ]; then
+        payload=$(jq -n \
+            --arg space "$space" \
+            --arg title "$title" \
+            --arg body "$body" \
+            --arg parent_id "$parent_id" \
+            '{
+                type: "page",
+                title: $title,
+                space: { key: $space },
+                body: {
+                    storage: {
+                        value: $body,
+                        representation: "storage"
+                    }
+                },
+                ancestors: [{ id: $parent_id }]
+            }')
+    else
+        payload=$(jq -n \
+            --arg space "$space" \
+            --arg title "$title" \
+            --arg body "$body" \
+            '{
+                type: "page",
+                title: $title,
+                space: { key: $space },
+                body: {
+                    storage: {
+                        value: $body,
+                        representation: "storage"
+                    }
+                }
+            }')
+    fi
 
     echo "Creating page '${title}' in space '${space}'..."
     response=$(api_call POST "/rest/api/content" -H "Content-Type: application/json" -d "$payload") || return 1
@@ -375,33 +399,36 @@ URL   : \($base)pages/viewpage.action?pageId=\(.id)"'
 
 # --- update ---
 cmd_update() {
-    local page_id="$1" title="$2" body="$3"
-    local response current_version
+    local page_id="$1" body="$2"
+    local response current_version current_title
 
-    # Fetch current page to get version number
+    # Fetch current page to get version number and title
     response=$(api_call GET "/rest/api/content/${page_id}") || return 1
     current_version=$(echo "$response" | jq -r '.version.number')
+    current_title=$(echo "$response" | jq -r '.title')
 
     local payload
-    payload=$(cat <<EOF
-{
-    "id": "$page_id",
-    "type": "page",
-    "title": "$title",
-    "body": {
-        "storage": {
-            "value": "$body",
-            "representation": "storage"
-        }
-    },
-    "version": {
-        "number": $(( current_version + 1 ))
-    }
-}
-EOF
-)
+    payload=$(jq -n \
+        --arg id "$page_id" \
+        --arg title "$current_title" \
+        --arg body "$body" \
+        --argjson version $(( current_version + 1 )) \
+        '{
+            id: $id,
+            type: "page",
+            title: $title,
+            body: {
+                storage: {
+                    value: $body,
+                    representation: "storage"
+                }
+            },
+            version: {
+                number: $version
+            }
+        }')
 
-    echo "Updating page ${page_id} to version $(( current_version + 1 ))..."
+    echo "Updating page '${current_title}' (ID: ${page_id}) to version $(( current_version + 1 ))..."
     response=$(api_call PUT "/rest/api/content/${page_id}" -H "Content-Type: application/json" -d "$payload") || return 1
 
     echo "Updated page successfully!"
@@ -421,18 +448,17 @@ cmd_add_comment() {
     local response
 
     local payload
-    payload=$(cat <<EOF
-{
-    "type": "comment",
-    "body": {
-        "storage": {
-            "value": "$comment",
-            "representation": "storage"
-        }
-    }
-}
-EOF
-)
+    payload=$(jq -n \
+        --arg comment "$comment" \
+        '{
+            type: "comment",
+            body: {
+                storage: {
+                    value: $comment,
+                    representation: "storage"
+                }
+            }
+        }')
 
     echo "Adding comment to page ${page_id}..."
     response=$(api_call POST "/rest/api/content/${page_id}/child/comment" \
@@ -467,16 +493,15 @@ Usage: wiki_skill.sh <command> [options]
 
 Commands:
   spaces     [--limit N]                 List all wiki spaces
-  page       --page-id ID                Get page by ID
-  page       --space KEY --title TITLE   Get page by space and title
+  page       --page-id ID [--raw]           Get page by ID (--raw: body only, no header)
+  page       --space KEY --title TITLE [--raw]  Get page by space and title
   search     --cql CQL [--limit N]       Search pages using CQL
   children   --page-id ID [--limit N]    Get child pages
   attachments --page-id ID               Get page attachments
   comments   --page-id ID [--limit N]    Get page comments
   create     --space KEY --title TITLE   Create a new page
              --body TEXT [--parent-id ID]
-  update     --page-id ID --title TITLE  Update an existing page
-             --body TEXT
+  update     --page-id ID --body TEXT      Update page content (title preserved)
   add-comment --page-id ID --comment TEXT Add a comment to a page
   config                                 Show current configuration
   setup                                  Re-run credential setup
@@ -540,17 +565,18 @@ main() {
 
     page)
         ensure_credentials
-        local page_id="" space="" title=""
+        local page_id="" space="" title="" raw_mode=""
         shift
         while [ $# -gt 0 ]; do
             case "$1" in
             --page-id) page_id="$2"; shift 2 ;;
             --space)   space="$2"; shift 2 ;;
             --title)   title="$2"; shift 2 ;;
+            --raw)     raw_mode="1"; shift ;;
             *) echo "Unknown option: $1" >&2; exit 1 ;;
             esac
         done
-        cmd_page "$page_id" "$space" "$title"
+        cmd_page "$page_id" "$space" "$title" "$raw_mode"
         ;;
 
     search)
@@ -646,21 +672,20 @@ main() {
 
     update)
         ensure_credentials
-        local page_id="" title="" body=""
+        local page_id="" body=""
         shift
         while [ $# -gt 0 ]; do
             case "$1" in
             --page-id) page_id="$2"; shift 2 ;;
-            --title)   title="$2"; shift 2 ;;
             --body)    body="$2"; shift 2 ;;
             *) echo "Unknown option: $1" >&2; exit 1 ;;
             esac
         done
-        if [ -z "$page_id" ] || [ -z "$title" ] || [ -z "$body" ]; then
-            echo "Error: --page-id, --title, and --body are required for update command" >&2
+        if [ -z "$page_id" ] || [ -z "$body" ]; then
+            echo "Error: --page-id and --body are required for update command" >&2
             exit 1
         fi
-        cmd_update "$page_id" "$title" "$body"
+        cmd_update "$page_id" "$body"
         ;;
 
     add-comment)

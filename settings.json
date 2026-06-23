@@ -47,7 +47,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bd prime"
+            "command": "bd prime",
+            "timeout": 15
           }
         ]
       }
@@ -58,16 +59,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/shentao.lu/.claude/env-wrapper.sh"
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "rtk hook claude"
+            "command": "rtk hook claude",
+            "timeout": 5
           }
         ]
       },
@@ -98,7 +91,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/shentao.lu/.claude/session-init.sh"
+            "command": "/home/shentao.lu/.claude/session-init.sh",
+            "timeout": 60
           },
           {
             "type": "command",
@@ -112,7 +106,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bd prime"
+            "command": "bd prime",
+            "timeout": 10
           }
         ]
       },
@@ -121,7 +116,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/cbm-session-reminder"
+            "command": "~/.claude/hooks/cbm-session-reminder",
+            "timeout": 5
           }
         ]
       }
