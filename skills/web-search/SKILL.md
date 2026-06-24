@@ -98,4 +98,5 @@ web 脚本退出码:
 5. **社交平台内容用 agent-reach skill**，不走 web-search
 6. 优先用类别搜索（`web it/science/packages`）而非通用搜索
 7. 不要用 `curl` 或 `wget` 直接抓网页
-8. 详情参考: [reranker](references/reranker.md) · [语言策略](references/language-strategy.md) · [内容提取](references/content-extraction.md) · [质量保证](references/quality-assurance.md)
+8. **质量过滤**：搜索结果按源可信度分层（T1-T5），T5 丢弃，T3 需交叉验证，T1/T2 直接采用（详见 [质量保证](references/quality-assurance.md)）
+9. 详情参考: [reranker](references/reranker.md) · [语言策略](references/language-strategy.md) · [内容提取](references/content-extraction.md) · [质量保证](references/quality-assurance.md)

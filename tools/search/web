@@ -34,7 +34,13 @@ set -euo pipefail
 
 # Global timeout guard: kill the whole script after WEB_MAX_TIMEOUT seconds
 # Prevents runaway processes from blocking Claude Code for 20+ minutes
-WEB_MAX_TIMEOUT="${WEB_MAX_TIMEOUT:-60}"
+# deep/extract commands get longer timeout (5 URLs × 60s each)
+_WEB_CMD="${1:-}"
+case "$_WEB_CMD" in
+    deep|extract|full) _WEB_DEFAULT_TIMEOUT=300 ;;
+    *) _WEB_DEFAULT_TIMEOUT=60 ;;
+esac
+WEB_MAX_TIMEOUT="${WEB_MAX_TIMEOUT:-$_WEB_DEFAULT_TIMEOUT}"
 if [ -z "${_WEB_WATCHDOG:-}" ] && [ "${WEB_MAX_TIMEOUT}" -gt 0 ]; then
     export _WEB_WATCHDOG=1
     (
@@ -52,9 +58,14 @@ _web_cleanup() {
 }
 trap _web_cleanup EXIT
 
+# Source shared config (single source of truth for all services)
+if [ -f "${WEB_CONFIG:-$HOME/.config/web-search/env}" ]; then
+    . "${WEB_CONFIG:-$HOME/.config/web-search/env}"
+fi
+
 SEARX_BIN="${SEARX_BIN:-searx}"
 SEARX_HOST="${SEARXNG_URL:-http://192.168.20.21:8005}"
-SEARX_TIMEOUT="${SEARX_TIMEOUT:-12}"
+SEARX_TIMEOUT="${SEARX_TIMEOUT:-30}"
 MIN_RESULTS="${WEB_MIN_RESULTS:-3}"
 RERANK_URL="${RERANK_URL:-http://172.16.90.45:8082}"
 RERANK_MODEL="${RERANK_MODEL:-scs_bge-reranker}"
@@ -182,6 +193,35 @@ for eng, query in engines:
         err = f" [{unresp[0][1][:30]}]"
     print(f"  {status} {eng:20s} → {n:>2} results ({elapsed:.1f}s){err}")
 
+# 4. LLM / Reranker proxy
+RERANK_URL = "http://172.16.90.45:8082"
+LLM_PROXY = "http://172.16.90.45:8082"
+print(f"\n🧠 LLM / Reranker 代理")
+print("-" * 58)
+
+# Reranker
+try:
+    start = time.time()
+    payload = json.dumps({"model": "scs_bge-reranker", "queries": ["test"], "items": ["hello world"]}).encode()
+    req = urllib.request.Request(RERANK_URL + "/v1/score",
+        data=payload, headers={"Content-Type": "application/json"})
+    resp = urllib.request.urlopen(req, timeout=5)
+    elapsed = time.time() - start
+    print(f"  ✅ {'Reranker (v1/score)':30s} → OK ({elapsed:.1f}s)")
+except Exception as e:
+    print(f"  ❌ {'Reranker (v1/score)':30s} → {str(e)[:30]}")
+
+# LLM chat (lightweight probe — models endpoint)
+try:
+    start = time.time()
+    req = urllib.request.Request(LLM_PROXY + "/v1/models",
+        headers={"Content-Type": "application/json"})
+    resp = urllib.request.urlopen(req, timeout=5)
+    elapsed = time.time() - start
+    print(f"  ✅ {'LLM Proxy (v1/models)':30s} → OK ({elapsed:.1f}s)")
+except Exception as e:
+    print(f"  ❌ {'LLM Proxy (v1/models)':30s} → {str(e)[:30]}")
+
 print(f"\n💡 策略建议: 不指定 --engine，用类别 (--it/--news/...) 或多引擎聚合")
 PYEOF
 }
@@ -217,143 +257,16 @@ parse_result_count() {
 }
 
 # ── BGE-Reranker integration ───────────────────────────────
-# Rerank search results using BGE-Reranker-v2-m3
-# Input: JSON from searx --raw on stdin
-# Output: Reordered JSON with rerank_score added
 rerank_results() {
     local query="$1"
-    export _WEB_QUERY="$query"
-    export _WEB_RERANK_URL="$RERANK_URL"
-    export _WEB_RERANK_MODEL="$RERANK_MODEL"
-    python3 -c "
-import sys, json, math, urllib.request, time, os
-
-query = os.environ['_WEB_QUERY']
-rerank_url = os.environ['_WEB_RERANK_URL']
-model = os.environ['_WEB_RERANK_MODEL']
-
-try:
-    data = json.load(sys.stdin)
-except:
-    sys.exit(0)
-
-results = data.get('results', [])
-if not results:
-    json.dump(data, sys.stdout, ensure_ascii=False)
-    sys.exit(0)
-
-# Build items for reranking
-items = []
-for r in results:
-    text = f\"{r.get('title','')} {r.get('content','')}\"
-    items.append(text[:500])
-
-# Call BGE-Reranker API
-payload = json.dumps({
-    'model': model,
-    'queries': [query],
-    'items': items
-}).encode()
-
-try:
-    start = time.time()
-    req = urllib.request.Request(
-        f'{rerank_url}/v1/score',
-        data=payload,
-        headers={'Content-Type': 'application/json'})
-    resp = urllib.request.urlopen(req, timeout=10)
-    elapsed = time.time() - start
-    score_data = json.loads(resp.read())
-except Exception as e:
-    # Reranker failed — return original results unchanged
-    data['_rerank'] = {'status': 'failed', 'error': str(e)}
-    json.dump(data, sys.stdout, ensure_ascii=False)
-    sys.exit(0)
-
-# Parse scores and apply sigmoid normalization
-raw_scores = [0.0] * len(items)
-for s in score_data.get('data', []):
-    raw_scores[s['index']] = s['score']
-
-def sigmoid(x):
-    return 1 / (1 + math.exp(-max(-500, min(500, x))))
-
-norm_scores = [sigmoid(s) for s in raw_scores]
-
-# Sort by score descending
-indexed = list(enumerate(results))
-indexed.sort(key=lambda x: norm_scores[x[0]], reverse=True)
-
-# Rebuild results with scores
-reranked = []
-for orig_idx, r in indexed:
-    r['rerank_score'] = round(norm_scores[orig_idx], 4)
-    r['rerank_raw'] = round(raw_scores[orig_idx], 4)
-    reranked.append(r)
-
-data['results'] = reranked
-data['_rerank'] = {
-    'status': 'ok',
-    'model': model,
-    'latency_s': round(elapsed, 3),
-    'count': len(reranked)
-}
-json.dump(data, sys.stdout, ensure_ascii=False)
-" 2>/dev/null
-    unset _WEB_QUERY _WEB_RERANK_URL _WEB_RERANK_MODEL
+    RERANK_URL="$RERANK_URL" RERANK_MODEL="$RERANK_MODEL" web-rerank "$query" 2>/dev/null
 }
 
 # ── Format reranked JSON as text ─────────────────────────
 format_reranked_output() {
     local query="$1"
     local display_count="$2"
-    export _WEB_QUERY="$query"
-    export _WEB_DISPLAY_COUNT="$display_count"
-    python3 -c "
-import sys, json, os
-
-data = json.load(sys.stdin)
-results = data.get('results', [])
-rerank_info = data.get('_rerank', {})
-query = os.environ['_WEB_QUERY']
-display_count = int(os.environ['_WEB_DISPLAY_COUNT'])
-
-# Header
-status = rerank_info.get('status', 'none')
-if status == 'ok':
-    latency = rerank_info.get('latency_s', 0)
-    total = len(results)
-    shown = min(display_count, total)
-    print(f'═══ 搜索结果: {query} [reranked {latency}s] ═══')
-    print(f'结果数: {total} (显示前 {shown})')
-    print()
-else:
-    total = len(results)
-    print(f'═══ 搜索结果: {query} ═══')
-    print(f'结果数: {total}')
-    print()
-
-# Results
-for i, r in enumerate(results[:display_count], 1):
-    title = r.get('title', '(无标题)')
-    url = r.get('url', '')
-    content = r.get('content', '')[:200]
-    engine = r.get('engine', '')
-    score = r.get('rerank_score', '')
-
-    score_str = f' [{score}]' if score else ''
-    print(f'[{i}] {title}{score_str}')
-    print(f'    URL: {url}')
-    if engine:
-        print(f'    来源: {engine}')
-    if content:
-        print(f'    {content}')
-    print()
-
-if not results:
-    print('(无搜索结果)')
-" 2>/dev/null
-    unset _WEB_QUERY _WEB_DISPLAY_COUNT
+    web-format-json "$query" "$display_count" 2>/dev/null
 }
 
 # ── SearXNG search with reranking + quality gate + 3 retries ─
@@ -639,7 +552,18 @@ case "$CMD" in
         done
         deep_raw_args+=("--count" "5" "--raw")
 
-        if timeout "$SEARX_TIMEOUT" "$SEARX_BIN" "$QUERY" --it "${deep_raw_args[@]}" > "$deep_tmp" 2>/dev/null; then
+        # Detect language: use --it for English, bare multi-engine for Chinese/CJK
+        deep_cat=("--it")
+        if echo "$QUERY" | python3 -c "
+import sys
+q = sys.stdin.read()
+has_cjk = any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af' for c in q)
+sys.exit(0 if has_cjk else 1)
+" 2>/dev/null; then
+            deep_cat=()  # CJK query: use all engines, don't restrict to --it
+        fi
+
+        if timeout "$SEARX_TIMEOUT" "$SEARX_BIN" "$QUERY" "${deep_cat[@]}" "${deep_raw_args[@]}" > "$deep_tmp" 2>/dev/null; then
             urls=$(python3 -c "
 import json,sys
 data = json.load(open('$deep_tmp'))
@@ -658,21 +582,38 @@ for i,r in enumerate(data.get('results',[])[:5],1):
     print()
 " 2>/dev/null
 
-            # Phase 2: fully extract each result (text-only for speed)
+            # Phase 2: parallel extraction (text-only for speed)
             if [ -n "$urls" ] && command -v web-extract &>/dev/null; then
                 echo "═══ 全文提取 ═══"
+
+                # Collect URLs with index, spawn extractors in background
+                deep_jobs_tmp=$(mktemp /tmp/web_deep_jobs.XXXXXX)
+                _WEB_TMPFILES+=("$deep_jobs_tmp")
                 idx=1
                 while IFS= read -r url; do
                     [ -z "$url" ] && continue
-                    echo ""
-                    echo "─── [$idx] ───"
-                    web-extract "$url" --max-chars 8000 --no-vision 2>/dev/null || echo "⚠️ 提取失败"
+                    ext_tmp=$(mktemp /tmp/web_ext_${idx}.XXXXXX)
+                    _WEB_TMPFILES+=("$ext_tmp")
+                    echo "${idx}|${url}|${ext_tmp}" >> "$deep_jobs_tmp"
                     idx=$((idx + 1))
                 done <<< "$urls"
+
+                # Launch all in background, wait for completion
+                while IFS='|' read -r job_idx job_url job_tmp; do
+                    (
+                        { echo ""; echo "─── [$job_idx] ───"; web-extract "$job_url" --max-chars 8000 --no-vision --summarize 2>/dev/null || echo "⚠️ 提取失败"; } > "$job_tmp"
+                    ) &
+                done < "$deep_jobs_tmp"
+                wait
+
+                # Concatenate in original order
+                while IFS='|' read -r job_idx job_url job_tmp; do
+                    cat "$job_tmp" 2>/dev/null
+                done < "$deep_jobs_tmp"
             fi
         else
             echo "⚠️ 搜索失败，降级到 do_search"
-            do_search "$QUERY" --deep --it "${EXTRA[@]}"
+            do_search "$QUERY" "${EXTRA[@]}"
         fi
         ;;
     synthesize)

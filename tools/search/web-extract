@@ -41,7 +41,8 @@ VISION_MODEL = os.environ.get("WEB_VISION_MODEL", "kimi-k2.6")
 SUMMARY_MODEL = os.environ.get("WEB_SUMMARY_MODEL", "deepseek-v4-pro")
 TIMEOUT = int(os.environ.get("WEB_TIMEOUT", "15"))
 # Global max wall-time guard: kill process group if exceeding WEB_EXTRACT_DEADLINE
-_WEB_EXTRACT_DEADLINE = int(os.environ.get("WEB_EXTRACT_DEADLINE", "60"))
+# Default disabled — caller (web script) manages timeouts. Set to >0 to enable self-guard.
+_WEB_EXTRACT_DEADLINE = int(os.environ.get("WEB_EXTRACT_DEADLINE", "0"))
 if _WEB_EXTRACT_DEADLINE > 0 and "_WEB_DEADLINE_SET" not in os.environ:
     import signal
     def _kill_group():
@@ -113,13 +114,13 @@ def fetch_html_raw(url: str) -> tuple[str, str]:
         return "", "failed"
 
 
-def fetch_html(url: str, prefer_jina: bool = True) -> tuple[str, str]:
+def fetch_html(url: str, prefer_jina: bool = True, no_jina_fallback: bool = False) -> tuple[str, str]:
     """4-tier fetch. Returns (content, source).
 
     Tier 1: Jina AI Reader (clean Markdown, JS-rendered, free)
     Tier 2: SearXNG proxy (cached, good IP reputation)
     Tier 3: Direct HTTP (raw HTML)
-    Tier 4: Failed
+    Tier 4: Failed (or Jina last-resort if no_jina_fallback=False)
     """
     if prefer_jina:
         content, source = fetch_via_jina(url)
@@ -131,7 +132,7 @@ def fetch_html(url: str, prefer_jina: bool = True) -> tuple[str, str]:
         return content, source
 
     # Last resort: try Jina even if prefer_jina was False
-    if not prefer_jina:
+    if not prefer_jina and not no_jina_fallback:
         content, source = fetch_via_jina(url)
         if content:
             return content, source
@@ -140,6 +141,28 @@ def fetch_html(url: str, prefer_jina: bool = True) -> tuple[str, str]:
 
 
 # ── Text extraction ──────────────────────────────────────
+
+def _jina_is_boilerplate(text: str) -> bool:
+    """Detect Jina output that's mostly navigation/cookie/footer boilerplate."""
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if len(lines) < 10:
+        return False
+    # Count short lines with URLs (navigation links)
+    short_url_lines = sum(1 for l in lines
+                          if len(l) < 120 and ('http://' in l or 'https://' in l))
+    # Character-level: what fraction of content is inside markdown links?
+    url_chars = sum(len(m) for m in re.findall(r'https?://\S+', text))
+    total_chars = max(len(text), 1)
+    url_density = url_chars / total_chars
+    # Cookie/privacy/footer keywords
+    boilerplate_keywords = ['cookie', 'privacy', 'consent', 'newsletter',
+                            'subscribe', 'sign in', 'sign up', '登录', '注册',
+                            '© 20', 'all rights reserved', 'Do Not Sell']
+    bp_lines = sum(1 for l in lines
+                   if any(kw in l.lower() for kw in boilerplate_keywords))
+    line_ratio = short_url_lines / max(len(lines), 1)
+    return line_ratio > 0.35 or url_density > 0.3 or (line_ratio > 0.2 and bp_lines > 2)
+
 
 def extract_text(html: str, fmt: str = "md", source: str = "unknown") -> tuple[str, str]:
     """trafilatura → readability → html2text → raw. Returns (text, source).
@@ -581,40 +604,57 @@ def format_output(text: str, images: list[dict], url: str,
     budget = max_chars - overhead
     compress_tag = ""
 
-    if len(text) <= max_chars:
-        # Fits — no compression needed
-        output = text.rstrip()
-    else:
-        output = text
-        # Stage 1: Extractive compression (keep high-signal paragraphs)
-        if len(output) + overhead > max_chars and budget > 200:
-            output = extractive_compress(output, budget)
-            compress_tag = "extractive"
-            if output and len(output) + overhead <= max_chars:
-                log(f"   Extractive: {len(text)} → {len(output)} chars (fits)")
+    output = text
 
-        # Stage 2: Abstractive compression (LLM with code protection)
-        if use_summary and len(output) + overhead > max_chars and budget > 200:
-            log(f"   Abstractive: {len(output)} → target ~{budget} chars")
-            compressed = abstractive_compress(output, url, budget)
-            if compressed and quality_gate(output, compressed):
+    # Stage 0: Always denoise when --summarize is explicitly requested (regardless of length)
+    if use_summary and len(output) > 200:
+        # For content that fits, use ~70% of its actual length as compression target
+        # to force LLM to drop noise (nav, cookies, footers) while keeping signal
+        is_boilerplate = _jina_is_boilerplate(output)
+        denoise_budget = max(int(len(output) * 0.7), 400) if len(output) + overhead <= max_chars else budget
+        if denoise_budget > 200:
+            log(f"   Denoise: {len(output)} chars → LLM filtering")
+            compressed = abstractive_compress(output, url, denoise_budget)
+            # Relax quality gate for known boilerplate (high URL count is expected noise)
+            gate_ok = quality_gate(output, compressed) if not is_boilerplate else len(compressed.strip()) > 100
+            if compressed and gate_ok:
                 output = compressed
-                compress_tag = "abstractive"
-                log(f"   Quality gate: PASS ({len(compressed)} chars)")
+                compress_tag = "denoised"
+                log(f"   Denoise: PASS ({len(compressed)} chars)")
             elif compressed:
-                log(f"   Quality gate: FAIL (signal loss detected) → keeping extractive")
+                log(f"   Denoise: FAIL (signal loss) → keeping original")
             else:
-                log(f"   Abstractive failed → keeping extractive")
+                log(f"   Denoise: API error → keeping original")
 
-        # Stage 3: Final truncation if still too large
-        if len(output) + overhead > max_chars:
-            budget = max_chars - overhead - 100
-            if budget < 200:
-                output = output[:max_chars - len(footer) - 50]
-                img_block = ""
-            else:
-                output = output[:budget]
-            output += f"\n\n---\n⚠️ 内容已截断 ({len(text)} → {len(output)} 字符)。"
+    # Stage 1: Extractive compression (keep high-signal paragraphs) — only if still too large
+    if not compress_tag and len(output) + overhead > max_chars and budget > 200:
+        output = extractive_compress(output, budget)
+        compress_tag = "extractive"
+        if output and len(output) + overhead <= max_chars:
+            log(f"   Extractive: {len(text)} → {len(output)} chars (fits)")
+
+    # Stage 2: Abstractive compression (LLM) — if still too large
+    if not compress_tag and use_summary and len(output) + overhead > max_chars and budget > 200:
+        log(f"   Abstractive: {len(output)} → target ~{budget} chars")
+        compressed = abstractive_compress(output, url, budget)
+        if compressed and quality_gate(output, compressed):
+            output = compressed
+            compress_tag = "abstractive"
+            log(f"   Abstractive: PASS ({len(compressed)} chars)")
+        elif compressed:
+            log(f"   Abstractive: FAIL (signal loss) → keeping extractive")
+        else:
+            log(f"   Abstractive: API error → keeping extractive")
+
+    # Stage 3: Final truncation if still too large
+    if len(output) + overhead > max_chars:
+        budget = max_chars - overhead - 100
+        if budget < 200:
+            output = output[:max_chars - len(footer) - 50]
+            img_block = ""
+        else:
+            output = output[:budget]
+        output += f"\n\n---\n⚠️ 内容已截断 ({len(text)} → {len(output)} 字符)。"
 
     # Build final
     result = output + img_block + footer
@@ -796,6 +836,20 @@ def main():
     if not args.no_text:
         t1 = time.time()
         text, text_source = extract_text(content, args.format, fetch_source)
+
+        # Jina garbage fallback: if Jina returned boilerplate (nav/cookies/footers),
+        # re-fetch with raw HTML and extract via trafilatura/readability
+        if text_source == "jina" and fetch_source == "jina" and _jina_is_boilerplate(text):
+            log(f"   ⚠ Jina returned boilerplate → retrying with raw HTML")
+            raw_content, raw_source = fetch_html(args.url, prefer_jina=False, no_jina_fallback=True)
+            if raw_content and raw_source != "failed":
+                log(f"   Raw fetch: {len(raw_content)} bytes from {raw_source}")
+                text2, src2 = extract_text(raw_content, args.format, raw_source)
+                if src2 != "jina" and len(text2.strip()) > 100:
+                    text, text_source, fetch_source = text2, src2, raw_source
+                    log(f"   Fallback text: {len(text)} chars via {text_source}")
+                else:
+                    log(f"   Raw extract also failed — keeping Jina output")
         log(f"   Text: {len(text)} chars via {text_source} ({time.time() - t1:.1f}s)")
 
     # 3. Find + describe images (only for raw HTML; Jina Markdown has no <img> tags)
