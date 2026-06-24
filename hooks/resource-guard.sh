@@ -28,7 +28,7 @@ except:
 
 # Only guard spawning operations
 case "$TOOL_NAME" in
-    Agent|TeamCreate|mcp__spawn-agent)
+    Task|mcp__spawn-agent)
         : # fall through to check
         ;;
     *)

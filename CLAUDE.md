@@ -13,17 +13,24 @@
 
 ## Agent Routing
 - Task ≥ 10 min → dispatch to specialized agent.
-- 2+ independent streams → team of agents.
-- New code >30 lines, refactor, review, debug, security, perf, API design, test, deploy → auto-dispatch.
+- New code >30 lines, refactor, review, debug, security, perf, API design, test → auto-dispatch.
+
+### Agent 职责边界
+| 场景 | Agent(s) | 说明 |
+|------|----------|------|
+| 代码审查 | `code-reviewer` **+** `security-reviewer` | 两个 agent 同时 dispatch，分别审查质量和安全 |
+| 架构分析 | `architect` | 只读，不调试运行时 bug |
+| 调试 | `debugger` → 失败 3 次后 `tracer` | debugger 先修，tracer 做深度因果分析 |
+| 方案审查 | `critic` | 只审查 plan/proposal，不审查代码 |
+| 代码清理 | `code-simplifier` | 不改行为，只改善可读性 |
 
 ## Skills & Commands
 - `/oh-my-claudecode:<name>` or keyword triggers: `autopilot`, `ultrawork`, `ralph`, `ralplan`, `deep-analyze`, `tdd`, `ultrathink`, `cancelomc`.
-- Agent catalog, team pipeline, commit protocol → `omc-reference` skill.
 
 ## Context
 - `<remember>` persists 7 days; `<remember priority>` permanent.
 - Kill switches: `DISABLE_OMC`, `OMC_SKIP_HOOKS`.
-- Worktree: `.omc/state/`, `.omc/notepad.md`, `.omc/project-memory.json`, `.omc/plans/`, `.omc/research/`, `.omc/logs/`.
+- Worktree: `.omc/state/`, `.omc/notepad.md`, `.omc/project-memory.json`, `.omc/plans/`, `.omc/research/`, `.omc/logs/`. All `.omc/` paths relative to git project root (not cwd).
 
 <!-- OMC:END -->
 

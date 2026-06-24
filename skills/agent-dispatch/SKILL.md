@@ -30,7 +30,20 @@ Check if the agent file exists locally:
 ```bash
 ls "${AGENTS_DIR:-$HOME/.claude/agents}/AGENT_NAME.md" 2>/dev/null
 ```
-If the file exists, skip to step 4.
+
+**Local agents always take priority.** If the local file exists, skip download and dispatch it directly (step 4). 
+The local agents in `~/.claude/agents/` have been customized with OMC integration, model selection, tool permissions, and project-specific workflows — these MUST be preferred over downloaded agents.
+
+Key local agents that override VoltAgent equivalents:
+| Keyword | VoltAgent | Local agent | Reason |
+|---------|-----------|-------------|--------|
+| review | code-reviewer | code-reviewer | Local has OMC integration, severity model, spec compliance stage |
+| debug | debugger | debugger | Local has investigation protocol, circuit breaker to tracer |
+| security | security-auditor | security-reviewer | Local has OWASP Top 10, secrets scan, dependency audit |
+| test | qa-expert | test-engineer | Local has TDD workflow, flaky test hardening |
+| architecture | architect-reviewer | architect | Local has trade-off analysis, ralplan consensus mode |
+
+If the local file exists, skip to step 4.
 
 ### Step 3: download the agent
 

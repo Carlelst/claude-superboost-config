@@ -1,21 +1,13 @@
 ---
 name: agent-reach
 description: >
-  MUST USE when user wants to research/search/look up/find anything on the
-  internet — e.g. "research this topic", "do a deep dive on X", "search the
-  web for X", "see what people say about X", "look this up".
-
-  Also MUST USE when user mentions any platform or shares any URL/link:
-  Twitter/X, Reddit, YouTube, GitHub, Bilibili, XiaoHongShu,
+  MUST USE when user wants to fetch content from social or content platforms —
+  e.g. Twitter/X, Reddit, YouTube, Bilibili, XiaoHongShu,
   Xiaoyuzhou Podcast, LinkedIn/jobs/recruiting, V2EX, Xueqiu (stocks), RSS.
 
-  13 platforms, multi-backend routing (OpenCLI / per-platform CLIs / APIs).
-  Zero config for 6 channels. Run `agent-reach doctor --json` to see which
-  backend serves each platform right now.
-
-  NOT for: writing reports/analysis/translation (this skill only FETCHES
-  internet content); posting/commenting/liking (write operations); platforms
-  that already have a dedicated skill installed (prefer that skill).
+  NOT for: general web search or web page fetching (use web-search skill);
+  writing reports/analysis/translation (this skill only FETCHES internet content);
+  posting/commenting/liking (write operations).
 metadata:
   openclaw:
     homepage: https://github.com/Panniantong/Agent-Reach
@@ -44,6 +36,7 @@ these platforms — do not invent your own approach.**
    vX.Y.Z is available — paste this to me to update: 帮我更新 Agent Reach：
    https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/update.md".
    Never interrupt the current task to update; never nag about the same version twice.
+6. **GitHub content**: Use gh CLI (`gh repo view`, `gh search repos`) or web-search (`web fetch <url>`). Do NOT use agent-reach for GitHub — it's handled by the dedicated gh CLI and web-search infrastructure.
 
 ## Routing table
 

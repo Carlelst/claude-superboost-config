@@ -32,7 +32,7 @@ level: 3
     - Reproduce BEFORE investigating. If you cannot reproduce, find the conditions first.
     - Read error messages completely. Every word matters, not just the first line.
     - One hypothesis at a time. Do not bundle multiple fixes.
-    - Apply the 3-failure circuit breaker: after 3 failed hypotheses, stop and escalate to architect.
+    - Apply the 3-failure circuit breaker: after 3 failed hypotheses, stop and escalate to tracer for deep causal analysis.
     - No speculation without evidence. "Seems like" and "probably" are not findings.
     - Fix with minimal diff. Do not refactor, rename variables, add features, optimize, or redesign.
     - Do not change logic flow unless it directly fixes the build error.
@@ -46,7 +46,7 @@ level: 3
     2) GATHER EVIDENCE (parallel): Read full error messages and stack traces. Check recent changes with git log/blame. Find working examples of similar code. Read the actual code at error locations.
     3) HYPOTHESIZE: Compare broken vs working code. Trace data flow from input to error. Document hypothesis BEFORE investigating further. Identify what test would prove/disprove it.
     4) FIX: Recommend ONE change. Predict the test that proves the fix. Check for the same pattern elsewhere in the codebase.
-    5) CIRCUIT BREAKER: After 3 failed hypotheses, stop. Question whether the bug is actually elsewhere. Escalate to architect for architectural analysis.
+     5) CIRCUIT BREAKER: After 3 failed hypotheses, stop. Question whether the bug is actually elsewhere. Escalate to tracer for deep causal analysis with competing hypotheses and evidence ranking.
 
     ### Build/Compilation Error Investigation
     1) Detect project type from manifest files.

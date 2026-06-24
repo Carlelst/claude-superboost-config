@@ -10,22 +10,13 @@ CTX_PCT=$(awk "BEGIN {printf \"%.0f\", $CTX_PCT_RAW}")
 DURATION=$(echo "$INPUT" | jq -r '.duration.total_seconds // 0' 2>/dev/null)
 
 # ---- Model → context window size fallback ----
-if [ "$CTX_SIZE" -le 0 ] 2>/dev/null; then
-  CACHE_FILE="/tmp/anthropic-proxy-active-model.txt"
-  if [ -f "$CACHE_FILE" ] && [ "$(find "$CACHE_FILE" -mmin -5 2>/dev/null)" ]; then
-    CTX_SIZE=$(cut -d: -f2 "$CACHE_FILE" 2>/dev/null)
+  if [ "$CTX_SIZE" -le 0 ] 2>/dev/null; then
+    # Fallback: use settings.json env value
+    CTX_SIZE=$(jq -r '.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS // "200000"' ~/.claude/settings.json 2>/dev/null)
   fi
   if [ "$CTX_SIZE" -le 0 ] 2>/dev/null; then
-    case "$MODEL" in
-      *v4*|*V4*)      CTX_SIZE=1048576 ;;  
-      *deepseek*)      CTX_SIZE=128000 ;;
-      *Opus*)          CTX_SIZE=200000 ;;
-      *Sonnet*)        CTX_SIZE=200000 ;;
-      *Haiku*)         CTX_SIZE=200000 ;;
-      *)               CTX_SIZE=200000 ;;
-    esac
+    CTX_SIZE=200000
   fi
-fi
 
 # ---- System RAM ----
 TOTAL_MB=$(awk '/MemTotal/    {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
@@ -82,14 +73,14 @@ fi
 AGENT_COUNT=$(( AGENT_COUNT - 1 ))
 [ "$AGENT_COUNT" -lt 0 ] && AGENT_COUNT=0
 
-PER_AGENT=800
+PER_AGENT="${RESOURCE_PER_AGENT_MB:-1000}"
 MAX_AGENTS=$(( (AVAIL_MB - 2048) / PER_AGENT ))
 [ "$MAX_AGENTS" -lt 0 ] 2>/dev/null && MAX_AGENTS=0
 [ "$MAX_AGENTS" -gt 15 ] 2>/dev/null && MAX_AGENTS=15
 
 # ---- Session time ----
 TIME_STR=""
-if [ "$(echo "$DURATION > 0" | bc 2>/dev/null)" = "1" ]; then
+if [ "$(awk "BEGIN {print ($DURATION > 0) ? 1 : 0}")" = "1" ]; then
   H=$(( ${DURATION%.*} / 3600 ))
   M=$(( (${DURATION%.*} % 3600) / 60 ))
   if [ "$H" -gt 0 ] 2>/dev/null; then

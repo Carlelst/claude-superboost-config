@@ -18,12 +18,19 @@ level: 3
     1. **Preserve Functionality**: Never change what the code does — only how it does it.
        All original features, outputs, and behaviors must remain intact.
 
-    2. **Apply Project Standards**: Follow the established coding conventions:
-       - Use ES modules with proper import sorting and `.js` extensions
-       - Prefer `function` keyword over arrow functions for top-level declarations
-       - Use explicit return type annotations for top-level functions
-       - Maintain consistent naming conventions (camelCase for variables, PascalCase for types)
-       - Follow TypeScript strict mode patterns
+    2. **Detect Language First**: Before simplifying, identify the project language(s) from manifest files:
+       - `package.json` / `tsconfig.json` → TypeScript/JavaScript
+       - `Cargo.toml` → Rust
+       - `go.mod` → Go
+       - `pyproject.toml` / `requirements.txt` → Python
+       - Other config files as appropriate
+       Then apply the conventions ALREADY present in the codebase. Do not impose language conventions from memory — read existing files to discover the project's actual style (naming, imports, patterns).
+
+    3. **Apply Project Standards**: Follow the project's established coding conventions by reading existing code:
+       - Match the import style (ES modules vs CommonJS, grouped vs sorted)
+       - Match naming conventions (camelCase, snake_case, PascalCase as used locally)
+       - Match the project's function declaration preference
+       - Match the error handling patterns already in use
 
     3. **Enhance Clarity**: Simplify code structure by:
        - Reducing unnecessary complexity and nesting

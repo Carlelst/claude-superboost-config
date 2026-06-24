@@ -65,7 +65,7 @@
         ]
       },
       {
-        "matcher": "Agent",
+        "matcher": "Task",
         "hooks": [
           {
             "type": "command",
@@ -134,17 +134,10 @@
   },
   "enabledPlugins": {
     "andrej-karpathy-skills@karpathy-skills": true,
-    "bash-language-server@claude-code-lsps": false,
     "plugin-dev@claude-plugins-official": true,
-    "pyright-lsp@claude-plugins-official": false,
-    "voltagent-core-dev@voltagent-subagents": false,
-    "voltagent-dev-exp@voltagent-subagents": false,
-    "voltagent-infra@voltagent-subagents": false,
     "voltagent-lang@voltagent-subagents": true,
-    "voltagent-meta@voltagent-subagents": false,
     "voltagent-qa-sec@voltagent-subagents": true,
     "vtsls@claude-code-lsps": true,
-    "yaml-language-server@claude-code-lsps": false,
     "oh-my-claudecode@omc-local": true,
     "claude-mem@thedotmack": true
   },
