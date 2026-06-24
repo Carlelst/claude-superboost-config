@@ -1,0 +1,15 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.enflame.cn/",
+    "ANTHROPIC_AUTH_TOKEN": "sk-Aog3yuSY323TTO3BKUwAcsdfUCMARR6qjQUYmhNXqZMTf4Ep",
+    "ANTHROPIC_MODEL": "deepseek-v4-pro[1m]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-pro[1m]",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-flash",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash",
+    "CLAUDE_CODE_EFFORT_LEVEL": "max",
+    "TMPDIR": "/home/kaizhang.zhang/.claude_cache"
+  },
+  "model": "opus",
+  "effortLevel": "xhigh"
+}

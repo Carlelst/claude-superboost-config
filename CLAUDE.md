@@ -27,17 +27,33 @@
 
 <!-- OMC:END -->
 
-## 搜索
+## 搜索架构（三层）
 
+### 第一层：代码库搜索 — codebase-memory-mcp + explore agent
+- **图优先**：`search_graph` → `trace_path` → `get_code_snippet` → `query_graph`（~500 tokens vs grep 80K）
+- **回退条件**：项目未索引 / 字符串字面量 / 配置文件 / 非代码文件 / 图结果不足
+- **大文件策略**：先 `get_code_snippet` 或 `lsp_document_symbols` 拿结构，再 `Read` 部分
+- **复杂探索**：dispatch explore agent（haiku），自动走 graph-first + 3+ 并行搜索
+
+### 第二层：网络搜索 — web-search skill
 | 场景 | 命令 |
 |------|------|
-| 关键词/IT/新闻/学术/包/仓库/问答 | `web search` / `web it` / `web news` / `web science` / `web packages` / `web repos` / `web qa` |
+| 关键词/IT/新闻/学术/包/问答 | `web search` / `web it` / `web news` / `web science` / `web packages` / `web qa` |
 | URL 抓取/深度搜索 | `web fetch <url>` / `web deep <query>` |
-| 社交平台 | agent-reach skill |
+| 降级 | web 脚本 → WebSearch/WebFetch |
+
+### 第三层：社交平台 — agent-reach skill
+Twitter/X, Reddit, YouTube, Bilibili, XiaoHongShu, V2EX, LinkedIn, RSS 等 13 平台
+
+### GitHub 内容边界
+| 场景 | 工具 | 示例 |
+|------|------|------|
+| 仓库信息/README | `gh repo view` | `gh repo view owner/repo --json description` |
+| 代码仓库搜索 | `gh search repos` | `gh search repos "topic" --sort stars` |
+| 网页文档/Issue/PR | `web fetch <url>` | `web fetch "https://github.com/org/repo/issues/1"` |
+| 开源项目发现 | `web repos` | `web repos "kubernetes operator"` |
 
 ## 工具
-
-- **代码探索**：优先 `codebase-memory-mcp` 的 search_graph / trace_path / get_code_snippet（需先 index_repository）
-- **纯文本搜索**：用 `ctx_search` 或 `Grep`
+- **代码探索**：优先 codebase-memory-mcp（需先 `index_repository`）→ 次选 `Grep`/`Glob`
 - **编辑**：先 `Read` 再 `Edit`
 - **大输出**：优先 lean-ctx 的 ctx_shell/ctx_read（带压缩），避免 bash 直接处理超大输出
