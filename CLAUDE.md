@@ -46,7 +46,8 @@
 | 场景 | 命令 |
 |------|------|
 | 关键词/IT/新闻/学术/包/问答 | `web search` / `web it` / `web news` / `web science` / `web packages` / `web qa` |
-| URL 抓取/深度搜索 | `web fetch <url>` / `web deep <query>` |
+| URL 抓取 | `web fetch <url>` |
+| 深度研究（搜索 + 全文 + LLM 合成） | `web deep <query>` 或 Vane (`http://localhost:3000`) |
 | 降级 | web 脚本 → WebSearch/WebFetch |
 
 ### 第三层：社交平台 — agent-reach skill
