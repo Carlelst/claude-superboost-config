@@ -1,0 +1,148 @@
+```toml
+# Agent index — scan by keyword. Format: keyword = "agent-name:category"
+# 144 lines, extracted from SKILL.md to save ~1000 tokens/load
+# Grep this file to find agents matching your task keyword
+
+# -- Code quality -----------------------------------------------
+review          = "code-reviewer:quality"
+refactor        = "refactoring-specialist:devex"
+lint            = "code-reviewer:quality"
+code-quality    = "code-reviewer:quality"
+simplify        = "refactoring-specialist:devex"
+dead-code       = "refactoring-specialist:devex"
+
+# -- Security ---------------------------------------------------
+security        = "security-auditor:quality"
+vulnerability   = "security-auditor:quality"
+owasp           = "security-auditor:quality"
+secrets         = "security-auditor:quality"
+penetration     = "penetration-tester:quality"
+audit           = "security-auditor:quality"
+compliance      = "compliance-auditor:quality"
+ad-security     = "ad-security-reviewer:quality"
+
+# -- Debugging and errors ---------------------------------------
+debug           = "debugger:quality"
+error           = "error-detective:quality"
+stacktrace      = "debugger:quality"
+crash           = "debugger:quality"
+troubleshoot    = "debugger:quality"
+
+# -- Testing ----------------------------------------------------
+test            = "qa-expert:quality"
+e2e             = "test-automator:quality"
+unit-test       = "test-automator:quality"
+integration     = "test-automator:quality"
+accessibility   = "accessibility-tester:quality"
+
+# -- Performance ------------------------------------------------
+performance     = "performance-engineer:quality"
+optimize        = "performance-engineer:quality"
+profiling       = "performance-engineer:quality"
+bottleneck      = "performance-engineer:quality"
+chaos           = "chaos-engineer:quality"
+
+# -- Architecture and design ------------------------------------
+api-design      = "api-designer:core"
+architecture    = "architect-reviewer:quality"
+microservices   = "microservices-architect:core"
+graphql         = "graphql-architect:core"
+websocket       = "websocket-engineer:core"
+
+# -- Frontend ---------------------------------------------------
+react           = "react-specialist:languages"
+nextjs          = "nextjs-developer:languages"
+vue             = "vue-expert:languages"
+angular         = "angular-architect:languages"
+ui              = "ui-designer:core"
+frontend        = "frontend-developer:core"
+electron        = "electron-pro:core"
+
+# -- Backend ----------------------------------------------------
+backend         = "backend-developer:core"
+django          = "django-developer:languages"
+rails           = "rails-expert:languages"
+spring          = "spring-boot-engineer:languages"
+laravel         = "laravel-specialist:languages"
+dotnet          = "dotnet-core-expert:languages"
+
+# -- Languages --------------------------------------------------
+typescript      = "typescript-pro:languages"
+javascript      = "javascript-pro:languages"
+python          = "python-pro:languages"
+rust            = "rust-engineer:languages"
+golang          = "golang-pro:languages"
+java            = "java-architect:languages"
+kotlin          = "kotlin-specialist:languages"
+swift           = "swift-expert:languages"
+cpp             = "cpp-pro:languages"
+csharp          = "csharp-developer:languages"
+elixir          = "elixir-expert:languages"
+php             = "php-pro:languages"
+sql             = "sql-pro:languages"
+flutter         = "flutter-expert:languages"
+powershell      = "powershell-7-expert:languages"
+
+# -- Infrastructure ---------------------------------------------
+docker          = "docker-expert:infra"
+kubernetes      = "kubernetes-specialist:infra"
+terraform       = "terraform-engineer:infra"
+terragrunt      = "terragrunt-expert:infra"
+cloud           = "cloud-architect:infra"
+aws             = "cloud-architect:infra"
+azure           = "azure-infra-engineer:infra"
+cicd            = "deployment-engineer:infra"
+devops          = "devops-engineer:infra"
+sre             = "sre-engineer:infra"
+platform        = "platform-engineer:infra"
+network         = "network-engineer:infra"
+incident        = "devops-incident-responder:infra"
+database        = "database-administrator:infra"
+
+# -- Data and AI ------------------------------------------------
+data-analysis   = "data-analyst:data"
+data-eng        = "data-engineer:data"
+data-science    = "data-scientist:data"
+machine-learning = "machine-learning-engineer:data"
+ml-ops          = "mlops-engineer:data"
+llm             = "llm-architect:data"
+nlp             = "nlp-engineer:data"
+prompt-eng      = "prompt-engineer:data"
+postgres        = "postgres-pro:data"
+db-optimize     = "database-optimizer:data"
+
+# -- Developer experience ---------------------------------------
+documentation   = "documentation-engineer:devex"
+cli             = "cli-developer:devex"
+build           = "build-engineer:devex"
+dependencies    = "dependency-manager:devex"
+git-workflow    = "git-workflow-manager:devex"
+dx              = "dx-optimizer:devex"
+legacy          = "legacy-modernizer:devex"
+mcp             = "mcp-developer:devex"
+tooling         = "tooling-engineer:devex"
+
+# -- Specialized domains ----------------------------------------
+blockchain      = "blockchain-developer:domains"
+fintech         = "fintech-engineer:domains"
+gamedev         = "game-developer:domains"
+iot             = "iot-engineer:domains"
+embedded        = "embedded-systems:domains"
+payments        = "payment-integration:domains"
+seo             = "seo-specialist:domains"
+mobile          = "mobile-app-developer:domains"
+
+# -- Business and product ---------------------------------------
+product         = "product-manager:business"
+project         = "project-manager:business"
+technical-write = "technical-writer:business"
+ux-research     = "ux-researcher:business"
+scrum           = "scrum-master:business"
+business        = "business-analyst:business"
+
+# -- Orchestration ----------------------------------------------
+coordinate      = "multi-agent-coordinator:meta"
+organize        = "agent-organizer:meta"
+workflow        = "workflow-orchestrator:meta"
+distribute      = "task-distributor:meta"
+```

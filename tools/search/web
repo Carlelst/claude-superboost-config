@@ -30,14 +30,16 @@
 #   3 — invalid usage
 # ============================================================
 
-set -euo pipefail
+set -uo pipefail
 
-# Global timeout guard: kill the whole script after WEB_MAX_TIMEOUT seconds
-# Prevents runaway processes from blocking Claude Code for 20+ minutes
-# deep/extract commands get longer timeout (5 URLs × 60s each)
+# Global timeout guard: kill the whole script after WEB_MAX_TIMEOUT seconds.
+# Uses background sleep+KILL — avoid bare `wait` (no args) as it waits for this
+# watchdog child too. Always `wait $pids` for specific background jobs.
+# deep/extract run longer (5 URLs × 90s each).
 _WEB_CMD="${1:-}"
 case "$_WEB_CMD" in
-    deep|extract|full) _WEB_DEFAULT_TIMEOUT=300 ;;
+    deep) _WEB_DEFAULT_TIMEOUT=600 ;;
+    extract|full) _WEB_DEFAULT_TIMEOUT=120 ;;
     *) _WEB_DEFAULT_TIMEOUT=60 ;;
 esac
 WEB_MAX_TIMEOUT="${WEB_MAX_TIMEOUT:-$_WEB_DEFAULT_TIMEOUT}"
@@ -70,6 +72,26 @@ MIN_RESULTS="${WEB_MIN_RESULTS:-3}"
 RERANK_URL="${RERANK_URL:-http://172.16.90.45:8082}"
 RERANK_MODEL="${RERANK_MODEL:-scs_bge-reranker}"
 RERANK_ENABLED="${RERANK_ENABLED:-true}"
+
+# Circuit breaker: track consecutive SearXNG failures to avoid hammering suspended engines
+_CB_FILE="${WEB_CB_FILE:-/tmp/web_circuit_breaker}"
+_cb_check() {
+    # Returns 0 if SearXNG should be attempted, 1 if circuit is open
+    if [ -f "$_CB_FILE" ]; then
+        local ts=$(cat "$_CB_FILE" 2>/dev/null || echo 0)
+        local now=$(date +%s)
+        if [ $((now - ts)) -lt 30 ]; then
+            return 1  # circuit open — skip SearXNG
+        fi
+    fi
+    return 0
+}
+_cb_fail() {
+    date +%s > "$_CB_FILE" 2>/dev/null || true
+}
+_cb_ok() {
+    rm -f "$_CB_FILE" 2>/dev/null || true
+}
 
 # ── Help ───────────────────────────────────────────────────
 usage() {
@@ -120,7 +142,7 @@ check_gh() {
 
 # ── Comprehensive probe ───────────────────────────────────
 probe_full() {
-    python3 << 'PYEOF'
+    timeout 60 python3 << 'PYEOF'
 import json, urllib.parse, urllib.request, time
 
 SEARXNG_URL = "http://192.168.20.21:8005"
@@ -153,7 +175,7 @@ except:
     print("⚠️  Cannot reach SearXNG config endpoint")
     n_engines, n_cats = 0, 0
 
-# 2. Category probe
+# 2. Category probe (concurrent)
 print(f"\n📂 类别健康度")
 print("-" * 58)
 cats = [
@@ -169,12 +191,16 @@ cats = [
     ("software wikis",   "systemd service",     "软件Wiki"),
     ("books",            "deep learning",       "书籍"),
 ]
-for cat, query, label in cats:
-    n, elapsed, unresp = search(query, {"categories": cat})
-    status = "✅" if n > 0 else "❌"
-    susp = len(unresp)
-    susp_str = f" [{susp} suspended]" if susp else ""
-    print(f"  {status} {cat:18s} ({label:6s}) → {n:>3} results ({elapsed:.1f}s){susp_str}")
+from concurrent.futures import ThreadPoolExecutor, as_completed
+with ThreadPoolExecutor(max_workers=5) as ex:
+    futures = {ex.submit(search, q, {"categories": c}): (c, l) for c, q, l in cats}
+    for f in as_completed(futures):
+        c, l = futures[f]
+        n, elapsed, unresp = f.result()
+        status = "✅" if n > 0 else "❌"
+        susp = len(unresp)
+        susp_str = f" [{susp} suspended]" if susp else ""
+        print(f"  {status} {c:18s} ({l:6s}) → {n:>3} results ({elapsed:.1f}s){susp_str}")
 
 # 3. Key individual engines
 print(f"\n🔧 关键引擎")
@@ -185,13 +211,14 @@ engines = [
     ("npm",     "express"),    ("mdn", "fetch api"),
     ("github",  "tokio"),      ("stackoverflow", "rust"),
 ]
-for eng, query in engines:
-    n, elapsed, unresp = search(query, {"engines": eng})
-    status = "✅" if n > 0 else "❌"
-    err = ""
-    if unresp:
-        err = f" [{unresp[0][1][:30]}]"
-    print(f"  {status} {eng:20s} → {n:>2} results ({elapsed:.1f}s){err}")
+with ThreadPoolExecutor(max_workers=5) as ex:
+    efutures = {ex.submit(search, q, {"engines": e}): e for e, q in engines}
+    for f in as_completed(efutures):
+        eng = efutures[f]
+        n, elapsed, unresp = f.result()
+        status = "✅" if n > 0 else "❌"
+        err = f" [{unresp[0][1][:30]}]" if unresp else ""
+        print(f"  {status} {eng:20s} → {n:>2} results ({elapsed:.1f}s){err}")
 
 # 4. LLM / Reranker proxy
 RERANK_URL = "http://172.16.90.45:8082"
@@ -273,6 +300,12 @@ format_reranked_output() {
 do_search_reranked() {
     local query="$1"; shift
     local extra_args=("$@")
+
+    # Circuit breaker: skip if SearXNG has been failing recently
+    if ! _cb_check; then
+        echo "⚠️  SearXNG circuit breaker open (recent failures) — skipping" >&2
+        return 1
+    fi
     local display_count=5
 
     # Extract --count if specified
@@ -353,6 +386,7 @@ else:
 
     # Attempt 0: original search
     if do_one_search "${raw_args[@]}"; then
+        _cb_ok
         cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
         return 0
     fi
@@ -367,6 +401,7 @@ else:
         esac
     done
     if do_one_search "${retry_raw[@]}"; then
+        _cb_ok
         cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
         return 0
     fi
@@ -375,9 +410,11 @@ else:
     if [ -s "$tmp_reranked" ]; then
         echo "⚠️  搜索质量偏低，以下为最佳可用结果" >&2
         cat "$tmp_reranked" | format_reranked_output "$query" "$display_count"
+        _cb_fail
         return 1
     fi
 
+    _cb_fail
     echo "" >&2
     echo "⚠️  SearXNG unavailable (host: $SEARX_HOST)" >&2
     echo "👉 FALLBACK: Use built-in WebSearch tool instead" >&2
@@ -544,13 +581,14 @@ case "$CMD" in
         _WEB_TMPFILES+=("$deep_tmp")
 
         deep_raw_args=()
+        deep_count=5
         ds=false
         for a in "${EXTRA[@]}"; do
-            if [ "$ds" = "true" ]; then ds=false; continue; fi
+            if [ "$ds" = "true" ]; then deep_count="$a"; ds=false; continue; fi
             if [ "$a" = "--count" ]; then ds=true; continue; fi
             deep_raw_args+=("$a")
         done
-        deep_raw_args+=("--count" "5" "--raw")
+        deep_raw_args+=("--count" "$deep_count" "--raw")
 
         # Detect language: use --it for English, bare multi-engine for Chinese/CJK
         deep_cat=("--it")
@@ -567,49 +605,32 @@ sys.exit(0 if has_cjk else 1)
             urls=$(python3 -c "
 import json,sys
 data = json.load(open('$deep_tmp'))
-for r in data.get('results',[])[:5]:
+for r in data.get('results',[])[:$deep_count]:
     print(r.get('url',''))
 " 2>/dev/null)
 
             # Format search results
-            cat "$deep_tmp" | rerank_results "$QUERY" 2>/dev/null | format_reranked_output "$QUERY" "5" 2>/dev/null || python3 -c "
+            cat "$deep_tmp" | rerank_results "$QUERY" 2>/dev/null | format_reranked_output "$QUERY" "$deep_count" 2>/dev/null || python3 -c "
 import json
 data = json.load(open('$deep_tmp'))
-for i,r in enumerate(data.get('results',[])[:5],1):
+for i,r in enumerate(data.get('results',[])[:$deep_count],1):
     print(f'[{i}] {r.get(\"title\",\"\")}')
     print(f'    URL: {r.get(\"url\",\"\")}')
     print(f'    {r.get(\"content\",\"\")[:200]}')
     print()
 " 2>/dev/null
 
-            # Phase 2: parallel extraction (text-only for speed)
+            # Phase 2: full extraction (sequential, each with 90s timeout)
             if [ -n "$urls" ] && command -v web-extract &>/dev/null; then
                 echo "═══ 全文提取 ═══"
-
-                # Collect URLs with index, spawn extractors in background
-                deep_jobs_tmp=$(mktemp /tmp/web_deep_jobs.XXXXXX)
-                _WEB_TMPFILES+=("$deep_jobs_tmp")
                 idx=1
                 while IFS= read -r url; do
                     [ -z "$url" ] && continue
-                    ext_tmp=$(mktemp /tmp/web_ext_${idx}.XXXXXX)
-                    _WEB_TMPFILES+=("$ext_tmp")
-                    echo "${idx}|${url}|${ext_tmp}" >> "$deep_jobs_tmp"
+                    echo ""
+                    echo "─── [$idx] ───"
+                    timeout 90 web-extract "$url" --max-chars 8000 --no-vision --summarize 2>/dev/null || echo "⚠️ 提取失败"
                     idx=$((idx + 1))
                 done <<< "$urls"
-
-                # Launch all in background, wait for completion
-                while IFS='|' read -r job_idx job_url job_tmp; do
-                    (
-                        { echo ""; echo "─── [$job_idx] ───"; web-extract "$job_url" --max-chars 8000 --no-vision --summarize 2>/dev/null || echo "⚠️ 提取失败"; } > "$job_tmp"
-                    ) &
-                done < "$deep_jobs_tmp"
-                wait
-
-                # Concatenate in original order
-                while IFS='|' read -r job_idx job_url job_tmp; do
-                    cat "$job_tmp" 2>/dev/null
-                done < "$deep_jobs_tmp"
             fi
         else
             echo "⚠️ 搜索失败，降级到 do_search"

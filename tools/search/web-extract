@@ -531,7 +531,11 @@ def quality_gate(original: str, compressed: str) -> bool:
     # Check: do URLs survive?
     orig_urls = set(re.findall(r'https?://\S+', original))
     comp_urls = set(re.findall(r'https?://\S+', compressed))
-    url_retention = len(comp_urls) / max(len(orig_urls), 1)
+    if len(orig_urls) > 0:
+        url_retention = len(comp_urls) / len(orig_urls)
+        if url_retention < 0.5:
+            return False
+    url_retention = 1.0  # no URLs in original → pass
 
     # Check: do code blocks survive?
     orig_blocks = len(re.findall(r'```', original)) // 2
@@ -606,8 +610,9 @@ def format_output(text: str, images: list[dict], url: str,
 
     output = text
 
-    # Stage 0: Always denoise when --summarize is explicitly requested (regardless of length)
-    if use_summary and len(output) > 200:
+    # Stage 0: Denoise via LLM when --summarize is set AND content exceeds budget
+    # (don't waste LLM calls on content that already fits)
+    if use_summary and len(output) > 200 and len(output) + overhead > max_chars:
         # For content that fits, use ~70% of its actual length as compression target
         # to force LLM to drop noise (nav, cookies, footers) while keeping signal
         is_boilerplate = _jina_is_boilerplate(output)
@@ -677,6 +682,34 @@ WX_DOMAINS = [
     "mp.weixin.qq.com",
     "mp.weixinbridge.com",
 ]
+
+SOGOU_WX_PREFIXES = [
+    "weixin.sogou.com/link",
+    "weixin.sogou.com/weixin",
+]
+
+
+def _resolve_sogou_wx(url: str) -> str:
+    """Follow sogou wechat redirect to get actual mp.weixin.qq.com URL."""
+    try:
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+        })
+        with urlopen(req, timeout=8) as resp:
+            final_url = resp.geturl()
+            if "mp.weixin.qq.com" in final_url:
+                return final_url
+    except Exception:
+        pass
+    return url
+
+
+def _is_sogou_wx(url: str) -> bool:
+    for prefix in SOGOU_WX_PREFIXES:
+        if prefix in url:
+            return True
+    return False
 
 
 def _url_matches_domain(url: str, domains: list[str]) -> bool:
@@ -783,6 +816,13 @@ def main():
     parser.add_argument("--no-summarize", action="store_true",
                         help="Disable LLM compression (force truncation)")
     args = parser.parse_args()
+
+    # ── Sogou WeChat redirect ────────────────────────────────
+    if _is_sogou_wx(args.url):
+        resolved = _resolve_sogou_wx(args.url)
+        if resolved != args.url:
+            log(f"↪  Sogou redirect → {resolved}")
+            args.url = resolved
 
     # ── WeChat domain route ─────────────────────────────────
     if _is_wx_domain(args.url):

@@ -1,6 +1,10 @@
 ---
 name: router
-description: 智能任务调度器。自动分析用户意图，匹配最合适的 worker agent，并行分派执行后汇总结果。Use when 用户一句话里有多个独立任务，或需要跨领域并行处理（如飞书+代码+架构图）。
+version: 1.0.0
+description: >
+  智能任务调度器。自动分析用户意图，匹配最合适的 worker agent，并行分派执行后汇总结果。
+  Use when 用户一句话里有多个独立任务，或需要跨领域并行处理（如飞书+代码+架构图）。
+  agent-dispatch handles single-task agent dispatch; router handles multi-intent parallel dispatch.
 ---
 
 # 智能路由器

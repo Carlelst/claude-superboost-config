@@ -1,5 +1,6 @@
 ---
 name: agent-reach
+version: 1.0.0
 description: >
   MUST USE when user wants to fetch content from social or content platforms —
   e.g. Twitter/X, Reddit, YouTube, Bilibili, XiaoHongShu,

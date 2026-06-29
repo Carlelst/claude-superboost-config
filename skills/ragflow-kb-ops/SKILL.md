@@ -1,9 +1,32 @@
 ---
 name: ragflow-kb-ops
+version: 1.0.0
 description: RAGFlow enterprise knowledge base operations. Import wiki/HTML documents with VLM image recognition, manage multi-KB deployments, configure Dify external knowledge proxy, and update Confluence wiki documentation. Use when working with RAGFlow KB import, batch_import.py, document parsing, embedding, VLM image enrichment, or deploying RAGFlow on 192.168.20.21 / 10.9.200.13.
 ---
 
-# RAGFlow 企业知识库运维手册
+# RAGFlow 企业知识库运维
+
+## 导入 Flow
+
+```
+cleanup → kb_admin create（或前端）→ batch_import → frontend tune → RAPTOR(opt)
+```
+
+1. **kb_admin.py** — 创建 KB（首次）/ 查 KB（后续）
+2. **batch_import.py** — PG 读元数据 → 增量对比 → 文档创建 → 入队 → 分块+向量化 → ES
+3. **前端调优** — 改 chunk/delimiter/RAPTOR 参数 → kb_cleanup → batch_import 重导
+4. **proxy** — Dify 外部知识库 API 格式转换 + source_url 溯源
+
+## 模块
+
+| 模块 | 功能 |
+|------|------|
+| `kb_admin.py` | create / delete / show KB |
+| `kb_cleanup.py` | 清理 MySQL 文档 / ES chunk / MinIO 临时文件 |
+| `batch_import.py` | 批量导入 + 增量同步 + 进度等待 |
+| `proxy/proxy_server.py` | Dify API 代理 + source_url 溯源 |
+
+## 环境（详细凭据见下方）
 
 ## 环境速查
 
@@ -14,19 +37,65 @@ description: RAGFlow enterprise knowledge base operations. Import wiki/HTML docu
 | 172.16.90.36 | MinIO (文档+图片) | 9000 |
 | 10.9.200.14 | PostgreSQL (wiki_metadata/html_metadata/wangpan_metadata) | 5432 |
 
-关键凭据: RAGFlow API key `ragflow-307044760fae4f548209426ba6191d9e`, KB ID `abfeeC35Ff4AfcDfF5Fa88b8D38Fb4Ce`, MySQL root/infini_rag_flow, MinIO minioadmin/minioadmin, PG postgres/enflame db:metadata
+关键凭据: 使用环境变量 — RAGFlow API key `${RAGFLOW_API_KEY}`, KB ID `${RAGFLOW_KB_ID}`, MySQL `${MYSQL_USER}/${MYSQL_PASSWORD}`, MinIO `${MINIO_ACCESS_KEY}/${MINIO_SECRET_KEY}`, PG `${PG_USER}/${PG_PASSWORD} db:${PG_DB}`
 
-## 导入流程
+> ⚠️ 实际凭据不在本文件中。在 `~/.bashrc` 或 `~/.config/ragflow/env` 中设置以上环境变量。
 
-完整的 6 步流程：PG获取数据 → VLM图片识别(wiki) → 增量分析 → 创建文档 → 分块+向量化 → (可选)RAPTOR
+## 架构设计
 
-### 基础命令
+分层架构，API 优先：
 
-```bash
-# 本机测试 (wiki)
-PYTHONUNBUFFERED=1 docker exec -e VLM_ENABLED=1 -e PYTHONUNBUFFERED=1 \
-  ragflow-test python3 /ragflow/tools/batch_import.py \
-  --config /ragflow/tools/batch_config.yaml --source wiki --wait
+```
+┌─ REST API 层 ─────────────────────────────┐
+│ KB 创建/配置 → POST/PUT /api/v1/datasets    │
+│ RAPTOR → POST /api/v1/datasets/{id}/run_raptor │
+├─ DB 直入层 ────────────────────────────────┤
+│ 文档创建 → Document/File/File2Document      │
+│ 任务入队 → queue_tasks (push Redis)          │
+├─ 外部数据层 ────────────────────────────────┤
+│ PG → wiki_metadata/html_metadata 读取       │
+│ MinIO → 文档 + 图片存储                      │
+├─ 业务逻辑层（自建）───────────────────────────┤
+│ 增量同步 → PG vs MySQL diff                  │
+│ 进度等待 → 轮询 document.progress            │
+│ 失败重试 → queue_tasks                       │
+│ Proxy溯源 → source_url_map                   │
+└────────────────────────────────────────────┘
+```
+
+| 层 | 方式 | 原因 |
+|------|------|------|
+| KB 管理 | REST API | UUID/embd_id 格式自动正确 |
+| 文档创建 | DB 直入 | 文件在外部 MinIO，API 不支持远程路径 |
+| RAPTOR | REST API | 避免版本兼容问题 |
+| 增量同步 | 自建 | API 无此功能 |
+
+**为什么不用 SDK/MCP**：SDK 只是 REST API 封装，功能一致。MCP 需要额外服务，单一 API 调用不划算。直接用 `requests` 调 REST API 最简。
+
+### 前端兼容性
+
+- `knowledgebase.embd_id`：存 `qwen3-vl-embedding-8b@VLLM` 格式（`@provider`）
+- `tenant_llm.llm_name`：存纯模型名 `qwen3-vl-embedding-8b`（不含 `___VLLM`）
+- `knowledgebase.id`：标准 UUID1 格式（32 hex）
+- `parser_config`：只含 API 文档支持的字段（`chunk_token_num`, `delimiter` 等，不含 `overlapped_percent`）
+- API 创建 KB 自动处理 UUID 生成和 embd_id 验证，避免手动 DB 操作的不兼容
+
+### VLM 图片识别
+
+结论：**不在导入时调用 VLM**。
+
+- 图片描述由 PG/MinIO 团队在元数据中提供
+- 导入时只做图片路径替换（相对路径 → MinIO HTTP URL）
+- RAGFlow 的 Markdown parser (type=md) 保留 `![](../images)` 引用，内部 `os.path.exists()` 找不到，不会下载/调 VLM
+- 当前 type=txt 配合 `\n\n` 分隔符，段落分块无 URL 截断
+
+### 模型代理 (172.16.90.45:8082)
+
+- Python `HTTPServer` 单线程 → `ThreadingMixIn` 多线程（systemd service: model-proxy）
+- embedding: `qwen3-vl-embedding-8b` → 10.12.116.244:8006
+- VLM: `scs_qwen3.5-397b` → 172.21.6.6:4000 (default upstream)
+- 代理 socket 超时已改为 120s
+- 200.13 可直连 backend，本机必须走代理
 
 # 本机 (html)
 PYTHONUNBUFFERED=1 docker exec ragflow-test python3 \
@@ -43,13 +112,13 @@ ssh "docker exec -e VLM_ENABLED=1 ragflow-server python3 /ragflow/tools/batch_im
 # 1. 杀进程
 docker exec ragflow-test pkill -9 -f batch_import
 # 2. 清 MySQL
-docker exec docker-mysql-1 mysql -u root -pinfini_rag_flow -e "
+docker exec docker-mysql-1 mysql -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" -e "
   DELETE FROM rag_flow.task WHERE doc_id IN (SELECT id FROM rag_flow.document WHERE kb_id='KB_ID');
   DELETE FROM rag_flow.file2document WHERE document_id IN (SELECT id FROM rag_flow.document WHERE kb_id='KB_ID');
   DELETE FROM rag_flow.document WHERE kb_id='KB_ID';
 "
 # 3. 清 MinIO 缓存
-python3 -c "from minio import Minio; c=Minio('172.16.90.36:9000',access_key='minioadmin',secret_key='minioadmin',secure=False); [c.remove_object('rag-data',o.object_name) for o in c.list_objects('rag-data',prefix='_vlm_enriched/',recursive=True)]"
+python3 -c "from minio import Minio; c=Minio('172.16.90.36:9000',access_key='$MINIO_ACCESS_KEY',secret_key='$MINIO_SECRET_KEY',secure=False); [c.remove_object('rag-data',o.object_name) for o in c.list_objects('rag-data',prefix='_vlm_enriched/',recursive=True)]"
 ```
 
 ### 失败重试
@@ -97,52 +166,11 @@ Dify 配置 `knowledge_id: "kb_wiki_id,kb_html_id"`，proxy 自动拆分为 data
 
 ## 关键修复记录
 
-项目中遇到的 Bug 及其修复方式：
+完整修复历史在 `references/fixes.md`（10 条记录，含文件路径和修复方式）。
 
-1. **Redis 连接 `list index out of range`**: RAGFlow 从 host 字段解析端口，host 必须含端口号
-   - 修复: `dify-redis-1:6379` 而非 `dify-redis-1`
-   - 文件: `rag/utils/redis_conn.py:129`
-
-2. **batch_import --limit 误删文档**: 增量同步时 limit 集外的文档被标记删除
-   - 修复: `limit > 0` 时跳过删除逻辑
-   - 文件: `tools/batch_import.py:601`
-
-3. **MinIO 路径重复拼接 `rag-data/rag-data/...`**: service_conf 的 bucket 字段导致 use_prefix_path 装饰器重复拼接
-   - 修复: 去掉 `minio.bucket` 配置项
-   - 文件: `rag/utils/minio_conn.py:82-86`
-
-4. **VLM 描述不完整**: 默认 token 512 限制，表格数据被截断
-   - 修复: `VLLM_MAX_TOKENS=1024`，prompt 改为逐行列出生数据
-
-5. **图片 URL 匹配错误**: 用 `in` 子串匹配导致不同图片 filename 交叉命中
-   - 修复: 构建 dict 精确映射 `filename → URL`
-
-6. **VLM Pipeline 演进**: 经历了三个阶段
-   - 阶段1: 自己写 VLM 调用 + 手动注入描述到正文 (灵活但维护成本高)
-   - 阶段2: 改为 RAGFlow 原生 Markdown parser (type=md) 自动处理图片 (质量高但 VLM 并发瓶颈)
-   - 最终: type=md (保留 Markdown 结构解析) + 图片路径替换为 MinIO HTTP URL
-   - 结论: RAGFlow 原生图片管线(VisionFigureParser)比手写 VLM 完善，但 VLM 与 embedding 挤在 task executor 里导致 API 过载
-   - 最终方案仍需平衡: type=md 结构好+图片 URL 保留，VLM 由批量导入前串行预处理
-
-7. **代理扩容 (172.16.90.45:8082)**: 
-   - 原 `HTTPServer` 单线程，32并发就 50% 超时
-   - 改 `ThreadingMixIn` 后 64并发 100% 通过
-   - 注意: 该代理路由 embedding → 10.12.116.244，VLM/LLM → 172.21.6.6:4000，两条链路独立
-
-8. **RAGFlow 版本兼容性**: 
-   - 容器跑 v0.25.6，本地仓库是 main 分支
-   - `docker cp` 代码进容器可能不兼容 (如 `ensure_mineru_from_env` 导入失败)
-   - 修复容器内代码时必须用同版本源文件
-
-9. **type=md vs type=txt 权衡**:
-   - md: Markdown parser 结构解析好 (标题/表格/列表)，但有 VLM 开销 (60-110s/doc)
-   - txt: TxtParser 快 (2-3s/doc)，但丢失结构
-   - 最佳: md + 无 VLM (图片保留 URL，VLM 单独预处理)
-
-10. **网络拓扑**:
-    - 本机 → 必须通过 172.16.90.45 代理访问所有内网服务
-    - 200.13 → 可直连 10.12.116.244 (embedding), 172.21.6.6 (VLM)
-    - 200.13 部署 VLM/embedding 都会更稳定
+```bash
+cat "${SKILL_DIR:-$CLAUDE_CONFIG_DIR/skills/ragflow-kb-ops}/references/fixes.md"
+```
 
 ## Wiki 文档更新
 
