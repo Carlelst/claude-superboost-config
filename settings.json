@@ -39,6 +39,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"/home/shentao.lu/.soul/hooks/session-scratchpad.sh\"",
+            "timeout": 2000
+          }
+        ]
       }
     ],
     "PreCompact": [
@@ -83,6 +93,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"/home/shentao.lu/.soul/hooks/write-guard.sh\"",
+            "timeout": 2000
+          }
+        ]
       }
     ],
     "SessionStart": [
@@ -119,7 +139,38 @@
     ],
     "UserPromptSubmit": [],
     "PostToolUseFailure": [],
-    "Stop": []
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/home/shentao.lu/.npm/_npx/696121a252c2bf06/node_modules/claude-soul-server/dist/hooks/on-stop.js\"",
+            "timeout": 15000
+          },
+          {
+            "type": "command",
+            "command": "bash \"/home/shentao.lu/.soul/hooks/session-journal.sh\"",
+            "timeout": 3000
+          },
+          {
+            "type": "command",
+            "command": "node \"/home/shentao.lu/.soul/hooks/session-agency.js\"",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "node \"/home/shentao.lu/.npm/_npx/696121a252c2bf06/node_modules/claude-soul-server/dist/cli/index-new.js\"",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "node \"/home/shentao.lu/.npm/_npx/696121a252c2bf06/node_modules/claude-soul-server/dist/hooks/correction-extractor.js\"",
+            "timeout": 30000
+          }
+        ]
+      }
+    ]
   },
   "statusLine": {
     "type": "command",
