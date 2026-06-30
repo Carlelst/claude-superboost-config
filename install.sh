@@ -140,9 +140,10 @@ cp env-wrapper.sh "$CONFIG_DIR/"
 chmod +x "$CONFIG_DIR/session-init.sh" "$CONFIG_DIR/env-wrapper.sh"
 
 # Hooks
-mkdir -p "$CONFIG_DIR/hooks"
-cp hooks/*.sh "$CONFIG_DIR/hooks/"
-chmod +x "$CONFIG_DIR/hooks/"*.sh
+mkdir -p "$CONFIG_DIR/hooks/auditor"
+cp hooks/*.sh "$CONFIG_DIR/hooks/" 2>/dev/null || true
+cp hooks/auditor/*.sh "$CONFIG_DIR/hooks/auditor/" 2>/dev/null || true
+chmod +x "$CONFIG_DIR/hooks/"*.sh "$CONFIG_DIR/hooks/auditor/"*.sh 2>/dev/null || true
 
 # Settings (merge MCP config, preserve existing)
 cp settings.json "$CONFIG_DIR/settings.json"
