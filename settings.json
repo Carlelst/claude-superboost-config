@@ -49,6 +49,17 @@
             "timeout": 2000
           }
         ]
+      },
+      {
+        "matcher": "Bash|Read|Write|Edit|Grep|Glob|Agent|Skill|WebFetch|WebSearch|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/auditor/audit-observe.sh",
+            "timeout": 3,
+            "statusMessage": "👁️ 审核中..."
+          }
+        ]
       }
     ],
     "PreCompact": [
@@ -138,7 +149,18 @@
       }
     ],
     "UserPromptSubmit": [],
-    "PostToolUseFailure": [],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/auditor/audit-failure.sh",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "matcher": "",
@@ -167,6 +189,30 @@
             "type": "command",
             "command": "node \"/home/shentao.lu/.npm/_npx/696121a252c2bf06/node_modules/claude-soul-server/dist/hooks/correction-extractor.js\"",
             "timeout": 30000
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/auditor/audit-subagent.sh",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/auditor/audit-aggregator.sh",
+            "timeout": 3
           }
         ]
       }

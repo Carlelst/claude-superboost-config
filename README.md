@@ -59,3 +59,28 @@ cd ~/.hub/claude-config
 ```
 
 脚本会自动复制最新配置文件、hooks、skills、agents，展示 diff，确认后 commit + push。
+
+## 🛡️ 实时审计系统 (Audit System)
+
+PostToolUse 阶段对 Claude Code 所有工具调用进行纯观察审计，永不阻断执行。
+
+### 架构
+```
+PostToolUse      → audit-observe.sh   (Bash/Read/Write/Edit/Grep/Glob/Agent/Skill/MCP/Web)
+PostToolUseFailure → audit-failure.sh  (所有失败的工具调用)
+SubagentStop     → audit-subagent.sh  (Agent 子调用追溯)
+PostToolBatch    → audit-aggregator.sh (HIGH 风险汇总报告)
+```
+
+### 审核维度
+| 维度 | 检测内容 |
+|------|---------|
+| 安全性 | 破坏性操作、权限提升、数据外泄、密钥泄露 |
+| 正确性 | 路径错误、权限拒绝、命令未找到 |
+| 数据访问 | 敏感文件读取、MCP 持久化写入、Web 内网请求 |
+| 异常 | SIGSEGV/OOM、工具调用失败、子代理追溯 |
+
+### 审核日志
+日志按 session 隔离存储：`~/.claude/audit/{session_id}.jsonl`
+
+查看 HIGH 风险：`cat ~/.claude/audit/*.jsonl | jq 'select(.level=="HIGH")'`
