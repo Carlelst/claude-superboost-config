@@ -250,7 +250,6 @@
     "andrej-karpathy-skills@karpathy-skills": true,
     "plugin-dev@claude-plugins-official": true,
     "voltagent-lang@voltagent-subagents": true,
-    "voltagent-qa-sec@voltagent-subagents": false,
     "vtsls@claude-code-lsps": true,
     "oh-my-claudecode@omc-local": true,
     "claude-mem@thedotmack": true

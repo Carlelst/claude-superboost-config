@@ -1,11 +1,31 @@
 {
-    "mcpServers": {
-        "codebase-memory-mcp": {
-            "command": "/path/to/codebase-memory-mcp"
-        },
-        "gitnexus": {
-            "command": "gitnexus",
-            "args": ["mcp"]
-        }
+  "mcpServers": {
+    "codebase-memory-mcp": {
+      "command": "/home/shentao.lu/.local/bin/codebase-memory-mcp"
+    },
+    "gitnexus": {
+      "command": "gitnexus",
+      "args": [
+        "mcp"
+      ]
+    },
+    "cn-financial": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "cn_financial_mcp"
+      ],
+      "env": {
+        "PYTHONPATH": "/home/shentao.lu/.local/src/cn-financial-mcp/src"
+      }
+    },
+    "drawio": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "drawio-mcp-server",
+        "--editor"
+      ]
     }
+  }
 }
