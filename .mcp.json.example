@@ -1,7 +1,7 @@
 {
     "mcpServers": {
         "codebase-memory-mcp": {
-            "command": "/home/shentao.lu/.local/bin/codebase-memory-mcp"
+            "command": "/path/to/codebase-memory-mcp"
         },
         "gitnexus": {
             "command": "gitnexus",
