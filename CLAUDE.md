@@ -34,7 +34,21 @@
 
 <!-- OMC:END -->
 
-## 搜索架构（三层）
+## 搜索架构（三层 + 零层）
+
+### 第零层：安全/影响分析 — gitnexus MCP（变更前必过）
+**定位**：修改代码前的安全闸门。不做日常搜索，只在以下场景触发：
+
+| 场景 | 工具 | 触发条件 |
+|------|------|---------|
+| 修改前评估影响 | `impact({target:"symbol",direction:"upstream"})` | 修改任何函数/类/方法前 |
+| 提交前安全检查 | `detect_changes({scope:"working_tree"})` | 提交前检查改动范围 |
+| PR 审查（图视角） | gitnexus-pr-review skill | 审查 PR 时 |
+| 陌生仓库架构理解 | 社区发现 + execution flows | 首次接触大仓库 |
+| 安全重构/重命名 | `rename({target,new_name})` | 重命名符号时 |
+| 数据流/污点追踪 | gitnexus-taint-analysis skill | 安全审计时 |
+
+> **仲裁规则**：gitnexus 只管"改了会坏什么"，codebase-memory-mcp 管"代码在哪里/怎么调"。
 
 ### 第一层：代码库搜索 — codebase-memory-mcp + explore agent
 - **图优先**：`search_graph` → `trace_path` → `get_code_snippet` → `query_graph`（~500 tokens vs grep 80K）
