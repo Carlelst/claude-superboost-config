@@ -51,6 +51,17 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node '/home/shentao.lu/.claude/hooks/gitnexus/gitnexus-hook.cjs'",
+            "timeout": 10,
+            "statusMessage": "Checking GitNexus index freshness..."
+          }
+        ]
+      },
+      {
         "matcher": "Bash|Read|Write|Edit|Grep|Glob|Agent|Skill|WebFetch|WebSearch|mcp__.*",
         "hooks": [
           {
@@ -58,17 +69,6 @@
             "command": "~/.claude/hooks/auditor/audit-observe.sh",
             "timeout": 3,
             "statusMessage": "👁️ 审核中..."
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node '~/.claude/hooks/gitnexus/gitnexus-hook.cjs'",
-            "timeout": 10,
-            "statusMessage": "Checking GitNexus index freshness..."
           }
         ]
       }
@@ -127,11 +127,11 @@
         ]
       },
       {
-        "matcher": "Grep|Glob|Bash",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "node '~/.claude/hooks/gitnexus/gitnexus-hook.cjs'",
+            "command": "node '/home/shentao.lu/.claude/hooks/gitnexus/gitnexus-hook.cjs'",
             "timeout": 10,
             "statusMessage": "Enriching with GitNexus graph context..."
           }
